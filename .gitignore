@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets — real env, never commit (.env.example is the tracked template)
+.env
+.env.local
+
+# Breez wallet state (encrypted seed material) and outbox DB
+data/
+
+# OS
+.DS_Store
