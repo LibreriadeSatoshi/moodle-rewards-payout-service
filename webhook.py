@@ -71,6 +71,7 @@ def _post(url: str, body: bytes) -> tuple[int, str]:
         method="POST",
         headers={
             "Content-Type": "application/json",
+            "User-Agent": "BtcPayoutService/0.1",
             "X-Webhook-Signature": _sign(body),
         },
     )
