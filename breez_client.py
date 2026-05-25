@@ -39,7 +39,9 @@ class _Listener(breez.EventListener):
         if status is None:
             return
         payment = getattr(event, "details", None)
-        tx_id = getattr(payment, "tx_id", None) if payment is not None else None
+        if payment is None or getattr(payment, "payment_type", None) == breez.PaymentType.RECEIVE:
+            return
+        tx_id = getattr(payment, "tx_id", None)
         if not tx_id:
             return
         payload = payload_for(payment, status)
