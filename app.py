@@ -2,6 +2,7 @@
 
 Contract:
   POST /pay                  → {tx_id, status, dest_type, error, retryable}
+  POST /parse                → {dest_type, invoice_msat}
   GET  /status/{tx_id}       → live SDK state (debug)
   GET  /balance              → wallet balance (debug)
   GET  /rate                 → BTC/USD rate in cents
@@ -75,6 +76,15 @@ class PayResponse(BaseModel):
     retryable: bool = True
 
 
+class ParseRequest(BaseModel):
+    destination: str
+
+
+class ParseResponse(BaseModel):
+    dest_type: str
+    invoice_msat: int | None = None
+
+
 class StatusResponse(BaseModel):
     tx_id: str
     status: str
@@ -113,6 +123,18 @@ def pay(body: PayRequest) -> PayResponse:
         error=result["error"],
         retryable=bool(result.get("retryable", True)),
     )
+
+
+@app.post("/parse", response_model=ParseResponse, dependencies=[auth_required])
+def parse(body: ParseRequest) -> ParseResponse:
+    """Decode a destination and return its type plus embedded amount (if any).
+    Used by the plugin to validate bolt11 amounts at claim time before
+    persisting a queue row."""
+    try:
+        result = breez_client.parse(body.destination)
+    except breez_client.UnsupportedDestination as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return ParseResponse(**result)
 
 
 @app.get("/status/{tx_id}", response_model=StatusResponse, dependencies=[auth_required])

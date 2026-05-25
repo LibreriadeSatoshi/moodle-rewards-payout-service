@@ -93,10 +93,11 @@ def disconnect() -> None:
         logger.info("Breez SDK disconnected")
 
 
-def classify(destination: str) -> str:
-    """Infer the payment type from the destination string via the SDK parser.
+def parse(destination: str) -> dict:
+    """Decode a destination via the SDK and return type + embedded amount.
 
-    Returns one of: 'onchain', 'bolt11', 'bolt12', 'ln_address'.
+    Returns: {'dest_type': 'onchain'|'bolt11'|'bolt12'|'ln_address',
+              'invoice_msat': int|None}  (msat only set for fixed-amount bolt11)
     Raises UnsupportedDestination for garbage input or unsupported types.
     """
     sdk = connect()
@@ -106,16 +107,26 @@ def classify(destination: str) -> str:
         raise UnsupportedDestination(f"Unparseable destination: {exc}") from exc
 
     if parsed.is_bitcoin_address():
-        return "onchain"
+        return {"dest_type": "onchain", "invoice_msat": None}
     if parsed.is_bolt11():
-        return "bolt11"
+        invoice_msat = getattr(parsed.invoice, "amount_msat", None)
+        return {"dest_type": "bolt11", "invoice_msat": invoice_msat}
     if parsed.is_bolt12_offer():
-        return "bolt12"
+        return {"dest_type": "bolt12", "invoice_msat": None}
     if parsed.is_ln_url_pay():
-        return "ln_address"
+        return {"dest_type": "ln_address", "invoice_msat": None}
 
     kind = type(parsed).__name__.removeprefix("_InputType_")
     raise UnsupportedDestination(f"Unsupported destination type: {kind}")
+
+
+def classify(destination: str) -> str:
+    """Infer the payment type from the destination string via the SDK parser.
+
+    Returns one of: 'onchain', 'bolt11', 'bolt12', 'ln_address'.
+    Raises UnsupportedDestination for garbage input or unsupported types.
+    """
+    return parse(destination)["dest_type"]
 
 
 def _run_send(label: str, op: Callable[[], "breez.Payment"]) -> dict:
