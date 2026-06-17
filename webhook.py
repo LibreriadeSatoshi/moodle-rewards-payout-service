@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 
-import breez_sdk_liquid as breez
+import breez_sdk_spark as spark
 
 import db
 from config import settings
@@ -25,27 +25,26 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 
-def event_to_terminal_status(event: breez.SdkEvent) -> str | None:
+def event_to_terminal_status(event: spark.SdkEvent) -> str | None:
     """Map an SDK event variant to a webhook-status string, or None for events
-    we don't surface (e.g. pending/syncing). Only terminal outcomes — settled,
-    failed, refunded — generate a webhook."""
+    we don't surface (e.g. pending/syncing). Only terminal outcomes — succeeded,
+    failed — generate a webhook."""
     if event.is_payment_succeeded():
         return "settled"
-    if event.is_payment_failed() or event.is_payment_refunded():
+    if event.is_payment_failed():
         return "failed"
     return None
 
 
 def payload_for(payment, status: str) -> dict:
-    """Build the outbound webhook body. Preimage is only populated for settled
-    Lightning payments; onchain payments have no preimage to attach."""
-    details = getattr(payment, "details", None)
-    preimage = getattr(details, "preimage", None) if details is not None else None
+    """Build the outbound webhook body. Preimage stays empty on Spark — the
+    Lightning payment details don't surface it on the listener event; the
+    plugin only uses it as a debug artefact."""
     return {
-        "tx_id": payment.tx_id,
+        "tx_id": payment.id,
         "status": status,
-        "amount_sats": payment.amount_sat,
-        "preimage": preimage or "",
+        "amount_sats": int(payment.amount or 0),
+        "preimage": "",
     }
 
 _POLL_INTERVAL_SEC = 5

@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # Breez SDK.
+    # Breez SDK Spark.
     breez_api_key: str
     breez_mnemonic: str
     breez_network: str = "mainnet"
@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     webhook_secret: str
 
     # Regtest-only BTC/USD rate override in USD (not cents), e.g. "60000".
-    # Breez's fetch_fiat_rates has no data on regtest — set this to let /rate
-    # return a deterministic number. Leave empty on mainnet.
+    # The Spark SDK's list_fiat_rates has no data on regtest — set this to
+    # let /rate return a deterministic number. Leave empty on mainnet.
     mock_btc_usd_rate: str = ""
 
     # Maximum sats this service is allowed to send in any rolling 24h window.

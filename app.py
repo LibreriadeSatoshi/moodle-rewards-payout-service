@@ -2,11 +2,9 @@
 
 Contract:
   POST /pay                  → {tx_id, status, dest_type, error, retryable}
-  POST /parse                → {dest_type, invoice_msat}
   GET  /status/{tx_id}       → live SDK state (debug)
   GET  /balance              → wallet balance (debug)
   GET  /rate                 → BTC/USD rate in cents
-  GET  /limits               → live per-rail send limits
   Webhook (outbound)         → Moodle receives terminal events, retried until 2xx
 """
 
@@ -15,11 +13,11 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 
-import breez_sdk_liquid as breez
+import breez_sdk_spark as spark
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-import breez_client
+import spark_client
 import rate as rate_module
 from config import settings
 from webhook import retrier
@@ -30,11 +28,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    breez_client.connect()
+    await spark_client.connect()
     retrier.start()
     yield
     retrier.stop()
-    breez_client.disconnect()
+    await spark_client.disconnect()
 
 
 app = FastAPI(title="BTC Payout Service", lifespan=lifespan)
@@ -50,11 +48,6 @@ def require_token(x_internal_token: str | None = Header(default=None)) -> None:
     """
     if not x_internal_token or x_internal_token != settings.internal_token:
         raise HTTPException(status_code=401, detail="Invalid token")
-
-
-def get_sdk() -> breez.BindingLiquidSdk:
-    """Return the singleton SDK handle."""
-    return breez_client.connect()
 
 
 # Convenience: route-level guard that doesn't pollute the handler signature.
@@ -76,15 +69,6 @@ class PayResponse(BaseModel):
     retryable: bool = True
 
 
-class ParseRequest(BaseModel):
-    destination: str
-
-
-class ParseResponse(BaseModel):
-    dest_type: str
-    invoice_msat: int | None = None
-
-
 class StatusResponse(BaseModel):
     tx_id: str
     status: str
@@ -94,12 +78,12 @@ class StatusResponse(BaseModel):
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.post("/pay", response_model=PayResponse, dependencies=[auth_required])
-def pay(body: PayRequest) -> PayResponse:
-    """Accept a payout request. Classifies the destination, fires off the payment,
-    and returns immediately. Terminal state arrives later via webhook."""
+async def pay(body: PayRequest) -> PayResponse:
+    """Accept a payout request, fire off the Lightning send, return immediately.
+    Terminal state arrives later via webhook."""
     cap = settings.daily_send_cap_sats
     if cap > 0:
-        spent = breez_client.daily_sent_sats()
+        spent = await spark_client.daily_sent_sats()
         if spent + body.amount_sats > cap:
             raise HTTPException(
                 status_code=429,
@@ -107,40 +91,25 @@ def pay(body: PayRequest) -> PayResponse:
             )
 
     try:
-        dest_type = breez_client.classify(body.destination)
-    except breez_client.UnsupportedDestination as exc:
+        await spark_client.ensure_ln_address(body.destination)
+    except spark_client.UnsupportedDestination as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
-    if dest_type == "onchain":
-        result = breez_client.send_onchain(body.destination, body.amount_sats)
-    else:
-        result = breez_client.send_lightning(body.destination, body.amount_sats, dest_type)
+    result = await spark_client.send_lightning(body.destination, body.amount_sats)
 
     return PayResponse(
         tx_id=result["tx_id"],
         status=result["status"],
-        dest_type=dest_type,
+        dest_type="ln_address",
         error=result["error"],
         retryable=bool(result.get("retryable", True)),
     )
 
 
-@app.post("/parse", response_model=ParseResponse, dependencies=[auth_required])
-def parse(body: ParseRequest) -> ParseResponse:
-    """Decode a destination and return its type plus embedded amount (if any).
-    Used by the plugin to validate bolt11 amounts at claim time before
-    persisting a queue row."""
-    try:
-        result = breez_client.parse(body.destination)
-    except breez_client.UnsupportedDestination as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return ParseResponse(**result)
-
-
 @app.get("/status/{tx_id}", response_model=StatusResponse, dependencies=[auth_required])
-def get_status(tx_id: str) -> StatusResponse:
+async def get_status(tx_id: str) -> StatusResponse:
     """Debug — reads live state from the SDK, not the outbox."""
-    info = breez_client.lookup_status(tx_id)
+    info = await spark_client.lookup_status(tx_id)
     if info is None:
         raise HTTPException(status_code=404, detail="tx_id not found")
     return StatusResponse(**info)
@@ -152,31 +121,25 @@ def health():
 
 
 @app.get("/balance", dependencies=[auth_required])
-def balance(sdk: breez.BindingLiquidSdk = Depends(get_sdk)):
-    """Debug — wallet balance in sats."""
-    w = sdk.get_info().wallet_info
+async def balance():
+    """Debug — wallet balance in sats. pending_* fields are synthesized from
+    list_payments since Spark's GetInfoResponse doesn't expose them."""
+    sdk = await spark_client.connect()
+    info = await sdk.get_info(request=spark.GetInfoRequest(ensure_synced=False))
+    pending = await spark_client.pending_balances()
     return {
-        "balance_sat": w.balance_sat,
-        "pending_send_sat": w.pending_send_sat,
-        "pending_receive_sat": w.pending_receive_sat,
+        "balance_sat": info.balance_sats,
+        "pending_send_sat": pending["pending_send_sat"],
+        "pending_receive_sat": pending["pending_receive_sat"],
     }
 
 
-@app.get("/limits", dependencies=[auth_required])
-def limits():
-    """Live per-rail send limits in sats. Onchain has a non-trivial floor
-    (Boltz swap minimum); Lightning has a much lower one. The plugin uses
-    this to warn the student before submitting an unpayable destination.
-    Cached ~60s in the breez_client module."""
-    return breez_client.get_send_limits()
-
-
 @app.get("/rate", dependencies=[auth_required])
-def rate():
+async def rate():
     """Current BTC/USD rate in cents per BTC. Plugin calls this at claim time
     to lock the USD→sats conversion. Cached ~60s in the rate module."""
     try:
-        cents = rate_module.get_cents_per_btc()
+        cents = await rate_module.get_cents_per_btc()
     except rate_module.RateUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {"cents_per_btc": cents}
