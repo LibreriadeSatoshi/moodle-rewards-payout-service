@@ -2,6 +2,7 @@
 
 Contract:
   POST /pay                  → {tx_id, status, dest_type, error, retryable}
+  POST /deposit              → {payment_request, fee_sat} bolt11 to fund the wallet
   GET  /status/{tx_id}       → live SDK state (debug)
   GET  /balance              → wallet balance (debug)
   GET  /rate                 → BTC/USD rate in cents
@@ -69,6 +70,16 @@ class PayResponse(BaseModel):
     retryable: bool = True
 
 
+class DepositRequest(BaseModel):
+    amount_sats: int
+    description: str = "BTC Rewards wallet funding"
+
+
+class DepositResponse(BaseModel):
+    payment_request: str
+    fee_sat: int = 0
+
+
 class StatusResponse(BaseModel):
     tx_id: str
     status: str
@@ -104,6 +115,20 @@ async def pay(body: PayRequest) -> PayResponse:
         error=result["error"],
         retryable=bool(result.get("retryable", True)),
     )
+
+
+@app.post("/deposit", response_model=DepositResponse, dependencies=[auth_required])
+async def deposit(body: DepositRequest) -> DepositResponse:
+    """Create a bolt11 invoice so an admin can fund the payout wallet from an
+    external wallet. The invoice expires after 1 hour."""
+    if body.amount_sats <= 0:
+        raise HTTPException(status_code=400, detail="amount_sats must be positive")
+    try:
+        result = await spark_client.create_deposit_invoice(body.amount_sats, body.description)
+    except Exception as exc:
+        logger.exception("deposit invoice creation failed")
+        raise HTTPException(status_code=502, detail=f"invoice creation failed: {exc}")
+    return DepositResponse(**result)
 
 
 @app.get("/status/{tx_id}", response_model=StatusResponse, dependencies=[auth_required])

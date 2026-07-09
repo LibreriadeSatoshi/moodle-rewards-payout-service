@@ -145,6 +145,26 @@ async def send_lightning(destination: str, amount_sats: int) -> dict:
     return await _run_send("lightning", _do)
 
 
+async def create_deposit_invoice(amount_sats: int, description: str) -> dict:
+    """Create a bolt11 invoice paying into this service's wallet.
+
+    Used by the plugin's admin "fund wallet" flow. Settlement is visible via
+    /balance; the webhook listener deliberately ignores RECEIVE events.
+    """
+    sdk = await connect()
+    response = await sdk.receive_payment(
+        request=spark.ReceivePaymentRequest(
+            payment_method=spark.ReceivePaymentMethod.BOLT11_INVOICE(
+                description=description,
+                amount_sats=amount_sats,
+                expiry_secs=3600,
+                payment_hash=None,
+            )
+        )
+    )
+    return {"payment_request": response.payment_request, "fee_sat": int(response.fee)}
+
+
 async def daily_sent_sats() -> int:
     """Sum of outbound sats over the last rolling 24 hours.
 
