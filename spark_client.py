@@ -159,6 +159,7 @@ async def create_deposit_invoice(amount_sats: int, description: str) -> dict:
                 amount_sats=amount_sats,
                 expiry_secs=3600,
                 payment_hash=None,
+                receiver_identity_public_key=None,
             )
         )
     )
