@@ -6,6 +6,7 @@ import sqlite3
 import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import breez_sdk_spark as spark
 import httpx
@@ -37,17 +38,17 @@ class FakeSDK:
 
     async def lnurl_pay(self, *, request):
         assert isinstance(request, spark.LnurlPayRequest)
-        assert request.idempotency_key is not None
+        payment_id = request.idempotency_key or str(uuid4())
         if os.environ['PROOF_MODE'] == 'crash_before_acceptance':
             os._exit(75)
         await asyncio.sleep(0.1)
         with sqlite3.connect('network.db') as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS sends (request_id TEXT)')
-            conn.execute('INSERT INTO sends VALUES (?)', (request.idempotency_key,))
+            conn.execute('INSERT INTO sends VALUES (?)', (payment_id,))
         if os.environ['PROOF_MODE'] == 'crash':
             # Real process death after external acceptance, before service persistence.
             os._exit(75)
-        return SimpleNamespace(payment=self.payment(request.idempotency_key))
+        return SimpleNamespace(payment=self.payment(payment_id))
 
     async def get_payment(self, *, request):
         assert isinstance(request, spark.GetPaymentRequest)
@@ -69,7 +70,8 @@ class FakeSDK:
 async def main():
     with patch.object(app.spark_client, 'connect', AsyncMock(return_value=FakeSDK())):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app.app), base_url='http://test') as client:
-            response = await client.post('/v2/pay', json=json.loads(sys.argv[1]), headers={'X-Internal-Token': 'test'})
+            response = await client.post(os.environ.get('PROOF_PATH', '/pay'), json=json.loads(sys.argv[1]),
+                                         headers={'X-Internal-Token': os.environ.get('PROOF_TOKEN', 'test')})
             print(json.dumps({'code': response.status_code, 'body': response.json()}))
 
 

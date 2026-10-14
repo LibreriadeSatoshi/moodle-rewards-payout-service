@@ -89,8 +89,8 @@ The service retries forever on non-2xx; the plugin must be idempotent by `tx_id`
 
 ## Recovery feasibility proof
 
-This branch adds an experimental `/v2/pay` route with a caller-supplied UUID
-`request_id`. It reserves the request in SQLite before sending, rejects reuse
+The existing `/pay` route accepts an optional caller-supplied UUID `request_id`
+to enable experimental recovery. With an ID, it reserves the request in SQLite before sending, rejects reuse
 with a different amount or destination, and reconciles repeated requests by
 payment ID. Missing or unavailable results remain `unknown` with `retryable:
 false`; callers must retain the same identity and must not create a replacement
@@ -99,8 +99,21 @@ sending. Known rejections before submission (`429` for the daily spending cap,
 `400` for an unsupported destination type, `502` when the destination could not
 be parsed or resolved, which may be temporary) are recorded with the reservation and
 returned unchanged for every repeat of that `request_id`; no payment was sent,
-so the caller may issue a new payout under a new `request_id`. The original
-`/pay` route does not provide these guarantees.
+so the caller may issue a new payout under a new `request_id`.
+
+Omitting `request_id` or passing `null` preserves the existing `/pay` behavior,
+without these recovery guarantees. Requests with an ID require a positive
+`amount_sats`, a nonempty `destination`, and no extra fields; malformed IDs are
+rejected with HTTP 422. The response format is unchanged. For example:
+
+```json
+{"amount_sats": 1000, "destination": "student@example.com", "request_id": "bb385061-d87a-4414-a2bb-2afc7de7a931"}
+```
+
+Before enabling IDs in callers, verify that every serving instance supports
+this optional field and shares the durable ledger. Older servers silently ignore
+unknown fields and may send a duplicate payment on retry. Do not enable keyed
+retries during a mixed-version rollout or fall back to requests without IDs.
 
 Run the proof without configuring a wallet:
 

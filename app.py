@@ -1,7 +1,6 @@
 """FastAPI payout gateway for the Moodle plugin.
 
 Contract:
-  POST /v2/pay               -> experimental durable identity and recovery proof
   POST /pay                  → {tx_id, status, dest_type, error, retryable}
   POST /deposit              → {payment_request, fee_sat} bolt11 to fund the wallet
   GET  /status/{tx_id}       → live SDK state (debug)
@@ -15,13 +14,14 @@ from __future__ import annotations
 import logging
 import json
 from uuid import UUID
+from typing import Any
 
 import db
 from contextlib import asynccontextmanager
 
 import breez_sdk_spark as spark
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import spark_client
 import rate as rate_module
@@ -62,16 +62,25 @@ auth_required = Depends(require_token)
 
 # ── Models ─────────────────────────────────────────────────────────────────
 
-class PayRequest(BaseModel):
-    amount_sats: int
-    destination: str
-
-
 class KeyedPayRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     request_id: UUID
     amount_sats: int = Field(gt=0)
     destination: str = Field(min_length=1)
+
+
+class PayRequest(BaseModel):
+    amount_sats: int
+    destination: str
+    request_id: UUID | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_keyed_request(cls, data: Any) -> Any:
+        # Preserve legacy validation when no recovery identity is supplied.
+        if isinstance(data, dict) and data.get("request_id") is not None:
+            return KeyedPayRequest.model_validate(data).model_dump()
+        return data
 
 
 class PayResponse(BaseModel):
@@ -103,7 +112,11 @@ class StatusResponse(BaseModel):
 @app.post("/pay", response_model=PayResponse, dependencies=[auth_required])
 async def pay(body: PayRequest) -> PayResponse:
     """Accept a payout request, fire off the Lightning send, return immediately.
-    Terminal state arrives later via webhook."""
+    An optional request ID enables durable recovery; terminal state also arrives
+    later via webhook."""
+    if body.request_id is not None:
+        return await _pay_with_request_id(body)
+
     cap = settings.daily_send_cap_sats
     if cap > 0:
         spent = await spark_client.daily_sent_sats()
@@ -129,11 +142,9 @@ async def pay(body: PayRequest) -> PayResponse:
     )
 
 
-@app.post("/v2/pay", response_model=PayResponse, dependencies=[auth_required])
-async def pay_v2(body: KeyedPayRequest) -> PayResponse:
-    """Proof endpoint: durable identity, single submission, conservative recovery.
+async def _pay_with_request_id(body: PayRequest) -> PayResponse:
+    """Durable identity, single submission, and conservative recovery for /pay.
 
-    The versioned route prevents old servers from silently ignoring request_id.
     An unknown result must be reconciled using this same key, never a new payout.
     """
     request_id = str(body.request_id)
