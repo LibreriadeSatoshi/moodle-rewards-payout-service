@@ -1,6 +1,7 @@
 """FastAPI payout gateway for the Moodle plugin.
 
 Contract:
+  POST /v2/pay               -> experimental durable identity and recovery proof
   POST /pay                  → {tx_id, status, dest_type, error, retryable}
   POST /deposit              → {payment_request, fee_sat} bolt11 to fund the wallet
   GET  /status/{tx_id}       → live SDK state (debug)
@@ -12,11 +13,15 @@ Contract:
 from __future__ import annotations
 
 import logging
+import json
+from uuid import UUID
+
+import db
 from contextlib import asynccontextmanager
 
 import breez_sdk_spark as spark
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 import spark_client
 import rate as rate_module
@@ -60,6 +65,13 @@ auth_required = Depends(require_token)
 class PayRequest(BaseModel):
     amount_sats: int
     destination: str
+
+
+class KeyedPayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: UUID
+    amount_sats: int = Field(gt=0)
+    destination: str = Field(min_length=1)
 
 
 class PayResponse(BaseModel):
@@ -115,6 +127,41 @@ async def pay(body: PayRequest) -> PayResponse:
         error=result["error"],
         retryable=bool(result.get("retryable", True)),
     )
+
+
+@app.post("/v2/pay", response_model=PayResponse, dependencies=[auth_required])
+async def pay_v2(body: KeyedPayRequest) -> PayResponse:
+    """Proof endpoint: durable identity, single submission, conservative recovery.
+
+    The versioned route prevents old servers from silently ignoring request_id.
+    An unknown result must be reconciled using this same key, never a new payout.
+    """
+    request_id = str(body.request_id)
+    row, owner = db.reserve_payout(request_id, body.destination, body.amount_sats)
+    if row["destination"] != body.destination or row["amount_sats"] != body.amount_sats:
+        raise HTTPException(status_code=409, detail="request_id already belongs to a different payout")
+    saved = json.loads(row["response_json"]) if row["response_json"] else None
+    if saved and saved["status"] in {"settled", "failed"}:
+        return PayResponse(**saved)
+    if not owner:
+        result = await spark_client.lookup_request(request_id)
+    else:
+        try:
+            cap = settings.daily_send_cap_sats
+            if cap > 0 and await spark_client.daily_sent_sats() + body.amount_sats > cap:
+                # No send occurred; keep the identity reserved for explicit reconciliation.
+                raise HTTPException(status_code=429, detail="daily send cap reached")
+            await spark_client.ensure_ln_address(body.destination)
+            result = await spark_client.send_lightning(body.destination, body.amount_sats, request_id=request_id)
+        except Exception:
+            logger.exception("Payout submission did not return a definitive result")
+            result = None
+    if result is None:
+        result = {"tx_id": "", "status": "unknown", "error": "Payment requires reconciliation", "retryable": False}
+    response = PayResponse(**result, dest_type="ln_address")
+    if result["status"] in {"settled", "failed"}:
+        db.record_payout(request_id, response.model_dump())
+    return response
 
 
 @app.post("/deposit", response_model=DepositResponse, dependencies=[auth_required])

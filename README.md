@@ -86,3 +86,31 @@ The service retries forever on non-2xx; the plugin must be idempotent by `tx_id`
   any LN address.
 - Breez SDK Spark supports **mainnet** and **regtest** only — there is no testnet.
 - In regtest, `list_fiat_rates` may not return USD; set `MOCK_BTC_USD_RATE` as a fallback.
+
+## Recovery feasibility proof
+
+This branch adds an experimental `/v2/pay` route with a caller-supplied UUID
+`request_id`. It reserves the request in SQLite before sending, rejects reuse
+with a different amount or destination, and reconciles repeated requests by
+payment ID. Missing or unavailable results remain `unknown` with `retryable:
+false`; callers must retain the same identity and must not create a replacement
+payment. A reservation is never submitted again, even if the process died before
+sending. The original `/pay` route does not provide these guarantees.
+
+Run the proof without configuring a wallet:
+
+```bash
+python -m pip install -r requirements-test.txt
+python -m unittest discover -s tests -v
+```
+
+The tests use temporary storage, fake configuration, the installed SDK request
+types, and a simulated payment network. They kill a subprocess after simulated
+acceptance and verify recovery across restart and concurrent requests. They do
+not verify native SDK or network crash durability.
+
+This is not ready for deployment. Remaining work includes native recovery
+validation, reconciliation of reserved but unsent requests (including validation
+and spending-cap failures), webhook recovery, plugin integration, and a rollout
+that drains legacy workers. Both the request ledger and SDK storage must survive
+restarts; restoring an older ledger and resuming sends is unsafe.
