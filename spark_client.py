@@ -97,9 +97,10 @@ async def disconnect() -> None:
 async def ensure_ln_address(destination: str) -> None:
     """Verify the SDK parses the destination as a Lightning address.
 
-    Raises UnsupportedDestination for anything else (onchain, bolt11/bolt12,
-    raw spark addresses) and for garbage input. The plugin layer additionally
-    enforces a domain allowlist; this is the rail-level check.
+    Raises UnsupportedDestination for a parsed non-Lightning-address type, or
+    its DestinationResolutionFailed subclass when parsing or resolution fails.
+    The plugin layer additionally enforces a domain allowlist; this is the
+    rail-level check.
     """
     sdk = await connect()
     try:

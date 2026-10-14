@@ -39,7 +39,7 @@ Outbound:
 - `spark_client.py` — SDK singleton and Lightning send path.
 - `rate.py` — BTC/USD rate cache.
 - `webhook.py` — outbox retrier and event→status helpers.
-- `db.py` — SQLite outbox (delivery state only; payment state lives in the SDK).
+- `db.py` - SQLite persistence; see its module docstring for state ownership.
 - `config.py` — pydantic-settings, loaded from `.env`.
 
 ## Setup
@@ -89,22 +89,25 @@ The service retries forever on non-2xx; the plugin must be idempotent by `tx_id`
 
 ## Recovery feasibility proof
 
-The existing `/pay` route accepts an optional caller-supplied UUID `request_id`
-to enable experimental recovery. With an ID, it reserves the request in SQLite before sending, rejects reuse
-with a different amount or destination, and reconciles repeated requests by
-payment ID. Missing or unavailable results remain `unknown` with `retryable:
-false`; callers must retain the same identity and must not create a replacement
+The existing `POST /pay` route accepts an optional caller-supplied UUID
+`request_id` to enable experimental recovery. `POST /v2/pay` is unavailable
+(HTTP 404). With an ID, `/pay` reserves the request in SQLite before sending,
+rejects reuse with a different amount or destination with HTTP 409, and replays
+saved `settled` or `failed` results. Otherwise, repeated requests reconcile by
+payment ID. Missing or unavailable results remain `unknown` with
+`retryable: false`; callers must retain the same identity and must not create a replacement
 payment. A reservation is never submitted again, even if the process died before
 sending. Known rejections before submission (`429` for the daily spending cap,
 `400` for an unsupported destination type, `502` when the destination could not
-be parsed or resolved, which may be temporary) are recorded with the reservation and
-returned unchanged for every repeat of that `request_id`; no payment was sent,
+be parsed or resolved, which may be temporary) are recorded with the reservation
+and returned unchanged for every repeat of that `request_id`; no payment was sent,
 so the caller may issue a new payout under a new `request_id`.
 
 Omitting `request_id` or passing `null` preserves the existing `/pay` behavior,
-without these recovery guarantees. Requests with an ID require a positive
+including authentication, error statuses, response format, and tolerance of extra
+fields, without these recovery guarantees. Requests with an ID require a positive
 `amount_sats`, a nonempty `destination`, and no extra fields; malformed IDs are
-rejected with HTTP 422. The response format is unchanged. For example:
+rejected with HTTP 422. The response fields are unchanged. For example:
 
 ```json
 {"amount_sats": 1000, "destination": "student@example.com", "request_id": "bb385061-d87a-4414-a2bb-2afc7de7a931"}
@@ -130,6 +133,7 @@ not verify native SDK or network crash durability.
 This is not ready for deployment. Remaining work includes native recovery
 validation, reconciliation of reserved but unsent requests (a crash before
 submission, or an SDK error while connecting or preparing the payment, still
-yields `unknown`), webhook recovery, plugin integration, and a rollout
-that drains legacy workers. Both the request ledger and SDK storage must survive
+yields `unknown`), webhook recovery, Moodle Rewards integration, reconciliation
+of ambiguous legacy payments without request IDs, and a rollout that drains
+legacy workers. Both the request ledger and SDK storage must survive
 restarts; restoring an older ledger and resuming sends is unsafe.
