@@ -1,8 +1,8 @@
-"""SQLite-backed outbox for webhook deliveries to Moodle.
+"""SQLite webhook outbox and experimental durable payout request ledger.
 
-Only persists delivery state — payment state itself lives in the Breez SDK.
-Each row represents one terminal event (settled/failed) that must reach
-Moodle. A row is considered done once `delivered_at` is set.
+SDK payment state remains authoritative. Request reservations prevent duplicate
+submission while terminal payment outcomes can be recovered after a restart.
+Outbox rows track terminal events until Moodle acknowledges delivery.
 """
 
 import json
@@ -26,6 +26,14 @@ def _ensure_db() -> None:
                 delivered_at     TEXT,
                 last_error       TEXT,
                 created_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payout_requests (
+                request_id TEXT PRIMARY KEY,
+                destination TEXT NOT NULL,
+                amount_sats INTEGER NOT NULL,
+                response_json TEXT
             )
         """)
         conn.execute("""
@@ -97,3 +105,25 @@ def mark_failed(tx_id: str, backoff_seconds: int, error: str) -> None:
 
 
 _ensure_db()
+
+
+def reserve_payout(request_id: str, destination: str, amount_sats: int) -> tuple[dict, bool]:
+    """Durably reserve a single submission before the SDK can send funds.
+
+    A row without a response is ambiguous, including a crash before SDK entry.
+    It may only be reconciled, never automatically submitted again.
+    """
+    with _conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO payout_requests (request_id, destination, amount_sats) VALUES (?, ?, ?)",
+            (request_id, destination, amount_sats),
+        )
+        inserted = cur.rowcount == 1
+        row = conn.execute("SELECT * FROM payout_requests WHERE request_id = ?", (request_id,)).fetchone()
+    return dict(row), inserted
+
+
+def record_payout(request_id: str, response: dict) -> None:
+    with _conn() as conn:
+        conn.execute("UPDATE payout_requests SET response_json = ? WHERE request_id = ?",
+                     (json.dumps(response, sort_keys=True), request_id))

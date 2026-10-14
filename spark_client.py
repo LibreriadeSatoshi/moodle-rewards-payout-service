@@ -25,6 +25,10 @@ class UnsupportedDestination(Exception):
     """Raised when the SDK can't parse the destination or the type isn't payable."""
 
 
+class DestinationResolutionFailed(UnsupportedDestination):
+    """Raised when the SDK can't parse or resolve the destination, possibly transiently."""
+
+
 class _Listener(spark.EventListener):
     """On terminal outbound payment events, enqueues a webhook delivery.
 
@@ -93,15 +97,16 @@ async def disconnect() -> None:
 async def ensure_ln_address(destination: str) -> None:
     """Verify the SDK parses the destination as a Lightning address.
 
-    Raises UnsupportedDestination for anything else (onchain, bolt11/bolt12,
-    raw spark addresses) and for garbage input. The plugin layer additionally
-    enforces a domain allowlist; this is the rail-level check.
+    Raises UnsupportedDestination for a parsed non-Lightning-address type, or
+    its DestinationResolutionFailed subclass when parsing or resolution fails.
+    The plugin layer additionally enforces a domain allowlist; this is the
+    rail-level check.
     """
     sdk = await connect()
     try:
         parsed = await sdk.parse(input=destination)
     except Exception as exc:
-        raise UnsupportedDestination(f"Unparseable destination: {exc}") from exc
+        raise DestinationResolutionFailed(f"Unparseable destination: {exc}") from exc
     if not parsed.is_lightning_address():
         raise UnsupportedDestination("Only Lightning address destinations are supported")
 
@@ -121,7 +126,7 @@ async def _run_send(label: str, op: Callable[[], Awaitable["spark.Payment"]]) ->
         return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True}
 
 
-async def send_lightning(destination: str, amount_sats: int) -> dict:
+async def send_lightning(destination: str, amount_sats: int, request_id: str | None = None) -> dict:
     """Send a Lightning payment to a Lightning address via the LNURL-pay flow.
 
     Returns: {tx_id, status, error, retryable}. For terminal outcomes a webhook
@@ -138,10 +143,14 @@ async def send_lightning(destination: str, amount_sats: int) -> dict:
             request=spark.PrepareLnurlPayRequest(amount=amount_sats, pay_request=pay_request)
         )
         response = await sdk.lnurl_pay(
-            request=spark.LnurlPayRequest(prepare_response=prepare)
+            request=spark.LnurlPayRequest(prepare_response=prepare, idempotency_key=request_id)
         )
         return response.payment
 
+    if request_id is not None:
+        # Keyed requests must not turn an ambiguous SDK error into a failed payment.
+        payment = await _do()
+        return {"tx_id": payment.id or "", "status": _map_status(payment.status), "error": "", "retryable": False}
     return await _run_send("lightning", _do)
 
 
@@ -225,3 +234,18 @@ def _map_status(sdk_status) -> str:
     if sdk_status == spark.PaymentStatus.PENDING:
         return "processing"
     return "accepted"
+
+
+async def lookup_request(request_id: str) -> dict | None:
+    """Reconcile by the SDK's stable payment id, without relying on a list window.
+
+    Missing and temporarily unavailable both mean unknown, never safe to resend.
+    """
+    try:
+        sdk = await connect()
+        response = await sdk.get_payment(request=spark.GetPaymentRequest(payment_id=request_id))
+        payment = response.payment
+        return {"tx_id": payment.id, "status": _map_status(payment.status), "error": "", "retryable": False}
+    except Exception:
+        logger.exception("Payment lookup unresolved")
+        return None

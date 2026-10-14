@@ -12,11 +12,16 @@ Contract:
 from __future__ import annotations
 
 import logging
+import json
+from uuid import UUID
+from typing import Any
+
+import db
 from contextlib import asynccontextmanager
 
 import breez_sdk_spark as spark
 from fastapi import Depends, FastAPI, Header, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import spark_client
 import rate as rate_module
@@ -57,9 +62,25 @@ auth_required = Depends(require_token)
 
 # ── Models ─────────────────────────────────────────────────────────────────
 
+class KeyedPayRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: UUID
+    amount_sats: int = Field(gt=0)
+    destination: str = Field(min_length=1)
+
+
 class PayRequest(BaseModel):
     amount_sats: int
     destination: str
+    request_id: UUID | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_keyed_request(cls, data: Any) -> Any:
+        # Preserve legacy validation when no recovery identity is supplied.
+        if isinstance(data, dict) and data.get("request_id") is not None:
+            return KeyedPayRequest.model_validate(data).model_dump()
+        return data
 
 
 class PayResponse(BaseModel):
@@ -91,7 +112,11 @@ class StatusResponse(BaseModel):
 @app.post("/pay", response_model=PayResponse, dependencies=[auth_required])
 async def pay(body: PayRequest) -> PayResponse:
     """Accept a payout request, fire off the Lightning send, return immediately.
-    Terminal state arrives later via webhook."""
+    An optional request ID enables durable recovery; terminal state also arrives
+    later via webhook."""
+    if body.request_id is not None:
+        return await _pay_with_request_id(body)
+
     cap = settings.daily_send_cap_sats
     if cap > 0:
         spent = await spark_client.daily_sent_sats()
@@ -115,6 +140,50 @@ async def pay(body: PayRequest) -> PayResponse:
         error=result["error"],
         retryable=bool(result.get("retryable", True)),
     )
+
+
+async def _pay_with_request_id(body: PayRequest) -> PayResponse:
+    """Durable identity, single submission, and conservative recovery for /pay.
+
+    An unknown result must be reconciled using this same key, never a new payout.
+    """
+    request_id = str(body.request_id)
+    row, owner = db.reserve_payout(request_id, body.destination, body.amount_sats)
+    if row["destination"] != body.destination or row["amount_sats"] != body.amount_sats:
+        raise HTTPException(status_code=409, detail="request_id already belongs to a different payout")
+    saved = json.loads(row["response_json"]) if row["response_json"] else None
+    if saved and "rejected" in saved:
+        raise HTTPException(**saved["rejected"])
+    if saved and saved["status"] in {"settled", "failed"}:
+        return PayResponse(**saved)
+    result = None
+    if not owner:
+        result = await spark_client.lookup_request(request_id)
+    else:
+        rejection = None
+        try:
+            cap = settings.daily_send_cap_sats
+            if cap > 0 and await spark_client.daily_sent_sats() + body.amount_sats > cap:
+                rejection = {"status_code": 429, "detail": "daily send cap reached"}
+            else:
+                await spark_client.ensure_ln_address(body.destination)
+                result = await spark_client.send_lightning(body.destination, body.amount_sats, request_id=request_id)
+        except spark_client.DestinationResolutionFailed as exc:
+            rejection = {"status_code": 502, "detail": f"destination resolution failed: {exc}"}
+        except spark_client.UnsupportedDestination as exc:
+            rejection = {"status_code": 400, "detail": str(exc)}
+        except Exception:
+            logger.exception("Payout submission did not return a definitive result")
+        if rejection:
+            # No send occurred; the identity stays reserved and every retry gets the same rejection.
+            db.record_payout(request_id, {"rejected": rejection})
+            raise HTTPException(**rejection)
+    if result is None:
+        result = {"tx_id": "", "status": "unknown", "error": "Payment requires reconciliation", "retryable": False}
+    response = PayResponse(**result, dest_type="ln_address")
+    if result["status"] in {"settled", "failed"}:
+        db.record_payout(request_id, response.model_dump())
+    return response
 
 
 @app.post("/deposit", response_model=DepositResponse, dependencies=[auth_required])
