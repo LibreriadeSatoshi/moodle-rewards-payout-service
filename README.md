@@ -95,7 +95,11 @@ with a different amount or destination, and reconciles repeated requests by
 payment ID. Missing or unavailable results remain `unknown` with `retryable:
 false`; callers must retain the same identity and must not create a replacement
 payment. A reservation is never submitted again, even if the process died before
-sending. The original `/pay` route does not provide these guarantees.
+sending. Known rejections before submission (`429` for the daily spending cap,
+`400` for an unsupported destination) are recorded with the reservation and
+returned unchanged for every repeat of that `request_id`; no payment was sent,
+so the caller may issue a new payout under a new `request_id`. The original
+`/pay` route does not provide these guarantees.
 
 Run the proof without configuring a wallet:
 
@@ -110,7 +114,8 @@ acceptance and verify recovery across restart and concurrent requests. They do
 not verify native SDK or network crash durability.
 
 This is not ready for deployment. Remaining work includes native recovery
-validation, reconciliation of reserved but unsent requests (including validation
-and spending-cap failures), webhook recovery, plugin integration, and a rollout
+validation, reconciliation of reserved but unsent requests (a crash before
+submission, or an SDK error while connecting or preparing the payment, still
+yields `unknown`), webhook recovery, plugin integration, and a rollout
 that drains legacy workers. Both the request ledger and SDK storage must survive
 restarts; restoring an older ledger and resuming sends is unsafe.

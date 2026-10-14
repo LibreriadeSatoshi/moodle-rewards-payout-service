@@ -18,11 +18,11 @@ class PaymentRecoveryTest(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
 
-    def call(self, mode='normal', **changes):
+    def call(self, mode='normal', cap=0, **changes):
         env = dict(os.environ, PYTHONPATH=str(ROOT), PROOF_MODE=mode,
                    BREEZ_API_KEY='test', BREEZ_MNEMONIC='test', INTERNAL_TOKEN='test',
                    MOODLE_WEBHOOK_URL='https://example.invalid/webhook', WEBHOOK_SECRET='test',
-                   DAILY_SEND_CAP_SATS='0', BREEZ_NETWORK='regtest')
+                   DAILY_SEND_CAP_SATS=str(cap), BREEZ_NETWORK='regtest')
         result = subprocess.run([sys.executable, str(ROOT / 'tests/payment_worker.py'), json.dumps(REQUEST | changes)],
                                 cwd=self.directory.name, env=env, capture_output=True, text=True, timeout=20)
         if mode.startswith('crash'):
@@ -63,6 +63,20 @@ class PaymentRecoveryTest(unittest.TestCase):
     def test_invalid_request_never_reaches_sdk(self):
         for changes in [{'amount_sats': 0}, {'request_id': 'not-a-uuid'}, {'extra_field': 'ignored?'}]:
             self.assertEqual(422, self.call(**changes)['code'])
+        self.assertFalse((Path(self.directory.name) / 'network.db').exists())
+
+    def test_spending_cap_rejection_is_definitive_and_never_sends(self):
+        for cap in [500, 0]:
+            result = self.call(cap=cap)
+            self.assertEqual(429, result['code'])
+            self.assertEqual('daily send cap reached', result['body']['detail'])
+        self.assertFalse((Path(self.directory.name) / 'network.db').exists())
+
+    def test_unsupported_destination_rejection_is_definitive_and_never_sends(self):
+        for mode in ['unsupported', 'normal']:
+            result = self.call(mode)
+            self.assertEqual(400, result['code'])
+            self.assertEqual('Only Lightning address destinations are supported', result['body']['detail'])
         self.assertFalse((Path(self.directory.name) / 'network.db').exists())
 
     def test_crash_before_acceptance_stays_unknown_without_sending(self):

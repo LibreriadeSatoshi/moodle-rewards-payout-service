@@ -16,7 +16,7 @@ import app
 
 class ParsedAddress:
     def is_lightning_address(self):
-        return True
+        return os.environ['PROOF_MODE'] != 'unsupported'
 
     def __getitem__(self, index):
         return SimpleNamespace(pay_request=object())
@@ -26,6 +26,9 @@ class FakeSDK:
     """Persist simulated network acceptance independently of the service ledger."""
     async def parse(self, *, input):
         return ParsedAddress()
+
+    async def list_payments(self, *, request):
+        return SimpleNamespace(payments=[])
 
     async def prepare_lnurl_pay(self, *, request):
         return object()

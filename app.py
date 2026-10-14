@@ -141,21 +141,30 @@ async def pay_v2(body: KeyedPayRequest) -> PayResponse:
     if row["destination"] != body.destination or row["amount_sats"] != body.amount_sats:
         raise HTTPException(status_code=409, detail="request_id already belongs to a different payout")
     saved = json.loads(row["response_json"]) if row["response_json"] else None
+    if saved and "rejected" in saved:
+        raise HTTPException(**saved["rejected"])
     if saved and saved["status"] in {"settled", "failed"}:
         return PayResponse(**saved)
+    result = None
     if not owner:
         result = await spark_client.lookup_request(request_id)
     else:
+        rejection = None
         try:
             cap = settings.daily_send_cap_sats
             if cap > 0 and await spark_client.daily_sent_sats() + body.amount_sats > cap:
-                # No send occurred; keep the identity reserved for explicit reconciliation.
-                raise HTTPException(status_code=429, detail="daily send cap reached")
-            await spark_client.ensure_ln_address(body.destination)
-            result = await spark_client.send_lightning(body.destination, body.amount_sats, request_id=request_id)
+                rejection = {"status_code": 429, "detail": "daily send cap reached"}
+            else:
+                await spark_client.ensure_ln_address(body.destination)
+                result = await spark_client.send_lightning(body.destination, body.amount_sats, request_id=request_id)
+        except spark_client.UnsupportedDestination as exc:
+            rejection = {"status_code": 400, "detail": str(exc)}
         except Exception:
             logger.exception("Payout submission did not return a definitive result")
-            result = None
+        if rejection:
+            # No send occurred; the identity stays reserved and every retry gets the same rejection.
+            db.record_payout(request_id, {"rejected": rejection})
+            raise HTTPException(**rejection)
     if result is None:
         result = {"tx_id": "", "status": "unknown", "error": "Payment requires reconciliation", "retryable": False}
     response = PayResponse(**result, dest_type="ln_address")
