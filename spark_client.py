@@ -25,6 +25,10 @@ class UnsupportedDestination(Exception):
     """Raised when the SDK can't parse the destination or the type isn't payable."""
 
 
+class DestinationResolutionFailed(UnsupportedDestination):
+    """Raised when the SDK can't parse or resolve the destination, possibly transiently."""
+
+
 class _Listener(spark.EventListener):
     """On terminal outbound payment events, enqueues a webhook delivery.
 
@@ -101,7 +105,7 @@ async def ensure_ln_address(destination: str) -> None:
     try:
         parsed = await sdk.parse(input=destination)
     except Exception as exc:
-        raise UnsupportedDestination(f"Unparseable destination: {exc}") from exc
+        raise DestinationResolutionFailed(f"Unparseable destination: {exc}") from exc
     if not parsed.is_lightning_address():
         raise UnsupportedDestination("Only Lightning address destinations are supported")
 

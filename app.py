@@ -157,6 +157,8 @@ async def pay_v2(body: KeyedPayRequest) -> PayResponse:
             else:
                 await spark_client.ensure_ln_address(body.destination)
                 result = await spark_client.send_lightning(body.destination, body.amount_sats, request_id=request_id)
+        except spark_client.DestinationResolutionFailed as exc:
+            rejection = {"status_code": 502, "detail": f"destination resolution failed: {exc}"}
         except spark_client.UnsupportedDestination as exc:
             rejection = {"status_code": 400, "detail": str(exc)}
         except Exception:

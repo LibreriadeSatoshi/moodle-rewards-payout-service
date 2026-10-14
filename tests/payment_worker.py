@@ -25,6 +25,8 @@ class ParsedAddress:
 class FakeSDK:
     """Persist simulated network acceptance independently of the service ledger."""
     async def parse(self, *, input):
+        if os.environ['PROOF_MODE'] == 'resolution_outage':
+            raise ConnectionError('Simulated LNURL host outage')
         return ParsedAddress()
 
     async def list_payments(self, *, request):

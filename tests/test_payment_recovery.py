@@ -79,6 +79,14 @@ class PaymentRecoveryTest(unittest.TestCase):
             self.assertEqual('Only Lightning address destinations are supported', result['body']['detail'])
         self.assertFalse((Path(self.directory.name) / 'network.db').exists())
 
+    def test_destination_resolution_failure_is_definitive_502_and_never_sends(self):
+        for mode in ['resolution_outage', 'normal']:
+            result = self.call(mode)
+            self.assertEqual(502, result['code'])
+            self.assertEqual('destination resolution failed: Unparseable destination: Simulated LNURL host outage',
+                             result['body']['detail'])
+        self.assertFalse((Path(self.directory.name) / 'network.db').exists())
+
     def test_crash_before_acceptance_stays_unknown_without_sending(self):
         self.call('crash_before_acceptance')
         self.assertEqual('unknown', self.call('missing')['body']['status'])

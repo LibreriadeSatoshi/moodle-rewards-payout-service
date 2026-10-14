@@ -96,7 +96,8 @@ payment ID. Missing or unavailable results remain `unknown` with `retryable:
 false`; callers must retain the same identity and must not create a replacement
 payment. A reservation is never submitted again, even if the process died before
 sending. Known rejections before submission (`429` for the daily spending cap,
-`400` for an unsupported destination) are recorded with the reservation and
+`400` for an unsupported destination type, `502` when the destination could not
+be parsed or resolved, which may be temporary) are recorded with the reservation and
 returned unchanged for every repeat of that `request_id`; no payment was sent,
 so the caller may issue a new payout under a new `request_id`. The original
 `/pay` route does not provide these guarantees.
