@@ -1,9 +1,13 @@
-"""SQLite-backed outbox for webhook deliveries to Moodle.
+"""SQLite-backed state: the webhook outbox and the payout ledger.
 
-Only persists delivery state — payment state itself lives in the Breez SDK.
-Each row represents one terminal event (settled/failed) that must reach
+Outbox: each row is one terminal event (settled/failed) that must reach
 Moodle. A row is considered done once `delivered_at` is set.
+
+Payout ledger: one row per payout_id the plugin asked us to pay, so a retried
+request never sends a second payment. Payment state itself lives in the SDK.
 """
+
+from __future__ import annotations
 
 import json
 import sqlite3
@@ -32,6 +36,20 @@ def _ensure_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_outbox_pending
             ON webhook_outbox(next_attempt_at)
             WHERE delivered_at IS NULL
+        """)
+        # state: 'sending' while the SDK call runs, 'sent' once it returned a
+        # payment, 'unknown' when the send raised and no payment could be found.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payouts (
+                payout_id    TEXT PRIMARY KEY,
+                amount_sats  INTEGER NOT NULL,
+                destination  TEXT NOT NULL,
+                state        TEXT NOT NULL,
+                tx_id        TEXT,
+                error        TEXT,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
         """)
 
 
@@ -94,6 +112,41 @@ def mark_failed(tx_id: str, backoff_seconds: int, error: str) -> None:
             """,
             (f"+{backoff_seconds}", error[:500], tx_id),
         )
+
+
+def get_payout(payout_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM payouts WHERE payout_id = ?", (payout_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def start_payout(payout_id: str, amount_sats: int, destination: str) -> None:
+    """Record that a send for payout_id is about to start. Raises
+    sqlite3.IntegrityError if the payout_id is already recorded."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO payouts (payout_id, amount_sats, destination, state) VALUES (?, ?, ?, 'sending')",
+            (payout_id, amount_sats, destination),
+        )
+
+
+def finish_payout(payout_id: str, state: str, tx_id: str = "", error: str = "") -> None:
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE payouts
+            SET state = ?, tx_id = ?, error = ?, updated_at = datetime('now')
+            WHERE payout_id = ?
+            """,
+            (state, tx_id or None, error[:500] or None, payout_id),
+        )
+
+
+def forget_payout(payout_id: str) -> None:
+    """Drop a payout that failed before any payment was attempted, so the
+    plugin's retry can send it."""
+    with _conn() as conn:
+        conn.execute("DELETE FROM payouts WHERE payout_id = ?", (payout_id,))
 
 
 _ensure_db()

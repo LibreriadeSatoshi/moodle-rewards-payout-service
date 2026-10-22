@@ -9,8 +9,6 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Awaitable, Callable
-
 import breez_sdk_spark as spark
 
 import db
@@ -106,43 +104,43 @@ async def ensure_ln_address(destination: str) -> None:
         raise UnsupportedDestination("Only Lightning address destinations are supported")
 
 
-async def _run_send(label: str, op: Callable[[], Awaitable["spark.Payment"]]) -> dict:
-    """Run an SDK send operation and shape success/failure into our response dict."""
-    try:
-        payment = await op()
-        return {
-            "tx_id": payment.id or "",
-            "status": _map_status(payment.status),
-            "error": "",
-            "retryable": True,
-        }
-    except Exception as exc:
-        logger.exception("%s payment failed", label)
-        return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True}
-
-
 async def send_lightning(destination: str, amount_sats: int) -> dict:
     """Send a Lightning payment to a Lightning address via the LNURL-pay flow.
 
-    Returns: {tx_id, status, error, retryable}. For terminal outcomes a webhook
-    will follow (from the listener); the caller gets only the *initial* state.
+    Returns: {tx_id, status, error, retryable, attempted}. `attempted` is False
+    when the send failed before the payment was handed to the SDK (parse or
+    prepare error), so retrying cannot pay twice. When it is True and tx_id is
+    empty, the payment may or may not have gone out.
+
+    For terminal outcomes a webhook will follow (from the listener); the caller
+    gets only the *initial* state.
     """
     sdk = await connect()
-
-    async def _do() -> "spark.Payment":
+    try:
         parsed = await sdk.parse(input=destination)
         if not parsed.is_lightning_address():
             raise UnsupportedDestination("Destination is not a Lightning address")
-        pay_request = parsed[0].pay_request
         prepare = await sdk.prepare_lnurl_pay(
-            request=spark.PrepareLnurlPayRequest(amount=amount_sats, pay_request=pay_request)
+            request=spark.PrepareLnurlPayRequest(amount=amount_sats, pay_request=parsed[0].pay_request)
         )
-        response = await sdk.lnurl_pay(
-            request=spark.LnurlPayRequest(prepare_response=prepare)
-        )
-        return response.payment
+    except Exception as exc:
+        logger.exception("lightning payment preparation failed")
+        return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True, "attempted": False}
 
-    return await _run_send("lightning", _do)
+    try:
+        response = await sdk.lnurl_pay(request=spark.LnurlPayRequest(prepare_response=prepare))
+    except Exception as exc:
+        logger.exception("lightning payment failed")
+        return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True, "attempted": True}
+
+    payment = response.payment
+    return {
+        "tx_id": payment.id or "",
+        "status": _map_status(payment.status),
+        "error": "",
+        "retryable": True,
+        "attempted": True,
+    }
 
 
 async def create_deposit_invoice(amount_sats: int, description: str) -> dict:
@@ -166,26 +164,62 @@ async def create_deposit_invoice(amount_sats: int, description: str) -> dict:
     return {"payment_request": response.payment_request, "fee_sat": int(response.fee)}
 
 
-async def daily_sent_sats() -> int:
-    """Sum of outbound sats over the last rolling 24 hours.
+class CapCheckUnavailable(Exception):
+    """Raised when the wallet's payment history can't be read for the daily cap."""
 
-    Used by the daily-cap policy at /pay. Failures fall back to 0 so a transient
-    SDK hiccup doesn't pause payouts; the cap is defense-in-depth, not the
-    primary correctness guarantee.
-    """
+
+async def _sends_since(from_timestamp: int) -> list:
+    """All outbound payments since from_timestamp, following pagination."""
     sdk = await connect()
-    one_day_ago = int(time.time()) - 86400
-    try:
+    payments: list = []
+    page = 100
+    while True:
         response = await sdk.list_payments(
             request=spark.ListPaymentsRequest(
-                from_timestamp=one_day_ago,
+                from_timestamp=from_timestamp,
                 type_filter=[spark.PaymentType.SEND],
+                offset=len(payments),
+                limit=page,
             )
         )
-    except Exception:
+        payments.extend(response.payments)
+        if len(response.payments) < page:
+            return payments
+
+
+async def daily_sent_sats() -> int:
+    """Sum of outbound sats over the last rolling 24 hours, failed sends excluded.
+
+    Used by the daily-cap policy at /pay. Raises CapCheckUnavailable if the SDK
+    can't list payments: the cap must fail closed, or an SDK error would turn it
+    off exactly when something is going wrong.
+    """
+    try:
+        payments = await _sends_since(int(time.time()) - 86400)
+    except Exception as exc:
         logger.exception("list_payments failed during daily-cap check")
-        return 0
-    return sum(int(p.amount or 0) for p in response.payments)
+        raise CapCheckUnavailable(str(exc)) from exc
+    return sum(int(p.amount or 0) for p in payments if p.status != spark.PaymentStatus.FAILED)
+
+
+async def find_send(amount_sats: int, since: int) -> dict | None:
+    """Newest non-failed outbound payment of amount_sats since `since`, if any.
+
+    Used after a send raised, to tell whether the payment went out anyway.
+    """
+    try:
+        payments = await _sends_since(since)
+    except Exception:
+        logger.exception("list_payments failed while looking for a sent payment")
+        return None
+    matches = [
+        p for p in payments
+        if int(p.amount or 0) == amount_sats and p.status != spark.PaymentStatus.FAILED
+    ]
+    if not matches:
+        return None
+    newest = max(matches, key=lambda p: p.timestamp)
+    return {"tx_id": newest.id, "status": _map_status(newest.status)}
 
 
 async def pending_balances() -> dict:
