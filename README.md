@@ -35,11 +35,11 @@ Outbound:
 
 ## Modules
 
-- `app.py` — FastAPI surface. Auth via `Depends`. Daily-cap check on `/pay`.
+- `app.py` — FastAPI surface. Auth via `Depends`. Amount, daily-cap and idempotency checks on `/pay`.
 - `spark_client.py` — SDK singleton and Lightning send path.
 - `rate.py` — BTC/USD rate cache.
 - `webhook.py` — outbox retrier and event→status helpers.
-- `db.py` — SQLite outbox (delivery state only; payment state lives in the SDK).
+- `db.py` — SQLite webhook outbox and payout ledger (payment state itself lives in the SDK).
 - `config.py` — pydantic-settings, loaded from `.env`.
 
 ## Setup
@@ -48,6 +48,7 @@ Outbound:
 cp .env.example .env      # then fill in real values
 make setup                # creates .venv, installs requirements
 make run                  # starts uvicorn with reload
+PYTHONPATH=. .venv/bin/python -m unittest discover -s tests   # tests
 ```
 
 ## Configuration
@@ -62,10 +63,32 @@ make run                  # starts uvicorn with reload
 | `WEBHOOK_SECRET`      | HMAC key for outbound webhook signatures. Distinct from `INTERNAL_TOKEN`.      |
 | `MOODLE_WEBHOOK_URL`  | Where to POST terminal events. Plugin endpoint: `…/local/btcrewards/webhook.php`. |
 | `HOST`, `PORT`        | uvicorn bind. Defaults `0.0.0.0:3000`.                                         |
-| `DAILY_SEND_CAP_SATS` | Optional global daily-spending ceiling (defense in depth).                     |
+| `DAILY_SEND_CAP_SATS` | Optional rolling 24h spending ceiling, also the largest single payout. Fails closed. |
 | `MOCK_BTC_USD_RATE`   | Optional fallback rate; only used if Spark `list_fiat_rates` fails.            |
 
 `.env` and `data/` are gitignored. `.env.example` is the tracked template.
+
+## Pay contract
+
+`POST /pay` takes `{payout_id, amount_sats, destination}`. `payout_id` is the
+plugin's id for the payout, unique per Moodle site.
+
+- **Never pays twice.** Each `payout_id` is recorded before the send. A repeat
+  returns the first attempt's outcome and sends nothing; a repeat with a
+  different amount or destination gets HTTP 409. Only a send that failed before
+  reaching the SDK (parse or prepare error) is forgotten, so the plugin's retry
+  can send it.
+- **Unknown outcome.** If the SDK send raises, the service looks for a matching
+  outbound payment in the wallet. If none is found, the payout is recorded as
+  `unknown` and answered with `retryable: false`, so it is never resent
+  automatically. To resolve one, check the wallet; only if nothing went out,
+  delete its row (`DELETE FROM payouts WHERE payout_id = ?` in
+  `data/outbox.db`) before the student claims again.
+- **Limits.** `amount_sats` must be positive and, with a cap set, at most
+  `DAILY_SEND_CAP_SATS`. Failed sends don't count toward the cap. If the
+  wallet history can't be read, `/pay` answers HTTP 503 instead of paying.
+- **One at a time.** Payouts are serialized, so concurrent requests can't both
+  pass the cap check. Run a single uvicorn worker.
 
 ## Webhook contract
 
