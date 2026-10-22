@@ -73,22 +73,23 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests   # tests
 `POST /pay` takes `{payout_id, amount_sats, destination}`. `payout_id` is the
 plugin's id for the payout, unique per Moodle site.
 
-- **Never pays twice.** Each `payout_id` is recorded before the send. A repeat
-  returns the first attempt's outcome and sends nothing; a repeat with a
-  different amount or destination gets HTTP 409. Only a send that failed before
-  reaching the SDK (parse or prepare error) is forgotten, so the plugin's retry
-  can send it.
-- **Unknown outcome.** If the SDK send raises, the service looks for a matching
-  outbound payment in the wallet. If none is found, the payout is recorded as
-  `unknown` and answered with `retryable: false`, so it is never resent
-  automatically. To resolve one, check the wallet; only if nothing went out,
-  delete its row (`DELETE FROM payouts WHERE payout_id = ?` in
-  `data/outbox.db`) before the student claims again.
+- **Pays at most once.** Every send passes the Breez SDK an idempotency key
+  derived from `payout_id` (a UUIDv5). The SDK checks its storage for that key
+  and uses it as the Spark transfer id, so repeating it returns the original
+  payment instead of paying again, also across restarts. Any failed send is
+  therefore safe to retry, and the plugin retries with the same `payout_id`.
+- **Ledger.** `payout_id`, amount and destination are recorded in
+  `data/outbox.db` before the first send. A repeat with a different amount or
+  destination gets HTTP 409. A repeat of a paid payout answers with that
+  payment's live status and sends nothing.
 - **Limits.** `amount_sats` must be positive and, with a cap set, at most
-  `DAILY_SEND_CAP_SATS`. Failed sends don't count toward the cap. If the
-  wallet history can't be read, `/pay` answers HTTP 503 instead of paying.
+  `DAILY_SEND_CAP_SATS`. The cap is checked once per new payout; failed sends
+  don't count. If the wallet history can't be read, `/pay` answers HTTP 503
+  instead of paying.
 - **One at a time.** Payouts are serialized, so concurrent requests can't both
-  pass the cap check. Run a single uvicorn worker.
+  pass the cap check. A request that waited more than 30 s for its turn gets
+  HTTP 503 rather than being sent after the plugin gave up on it. Run a single
+  uvicorn worker.
 
 ## Webhook contract
 

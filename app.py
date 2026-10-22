@@ -2,7 +2,7 @@
 
 Contract:
   POST /pay                  → {tx_id, status, dest_type, error, retryable}
-                               idempotent by payout_id: a repeat never pays twice
+                               idempotent by payout_id: a payout_id pays at most once
   POST /deposit              → {payment_request, fee_sat} bolt11 to fund the wallet
   GET  /status/{tx_id}       → live SDK state (debug)
   GET  /balance              → wallet balance (debug)
@@ -101,56 +101,63 @@ class StatusResponse(BaseModel):
 # One payout at a time, so the daily-cap check and the send can't interleave.
 _pay_lock = asyncio.Lock()
 
+# A request that waited longer than this for the lock is refused instead of
+# sent: the plugin has likely timed out on it already and will retry the same
+# payout_id later.
+MAX_LOCK_WAIT_SECONDS = 30
+
 
 @app.post("/pay", response_model=PayResponse, dependencies=[auth_required])
 async def pay(body: PayRequest) -> PayResponse:
-    """Accept a payout request, fire off the Lightning send, return immediately.
-    Terminal state arrives later via webhook."""
+    """Send a payout, at most once per payout_id. Terminal state arrives later via webhook.
+
+    Every send uses an SDK idempotency key derived from payout_id, so a retry
+    after a timeout, crash or SDK error returns the original payment if one was
+    made and pays only if none was.
+    """
     cap = settings.daily_send_cap_sats
     if body.amount_sats <= 0:
         raise HTTPException(status_code=400, detail="amount_sats must be positive")
     if cap > 0 and body.amount_sats > cap:
         raise HTTPException(status_code=400, detail=f"amount_sats exceeds the daily cap of {cap} sats")
 
+    waiting_since = time.monotonic()
     async with _pay_lock:
+        if time.monotonic() - waiting_since > MAX_LOCK_WAIT_SECONDS:
+            raise HTTPException(status_code=503, detail="service busy, retry later")
+
         existing = db.get_payout(body.payout_id)
         if existing is not None:
-            return _replay(existing, body)
-
-        if cap > 0:
+            if existing["amount_sats"] != body.amount_sats or existing["destination"] != body.destination:
+                raise HTTPException(status_code=409, detail="payout_id was already used for a different payment")
+            if existing["state"] == "sent":
+                return await _sent_response(existing["tx_id"])
+            # An earlier attempt did not get a payment back. Resending with the
+            # same key is safe, so the cap was already charged for it: skip the check.
+        else:
+            if cap > 0:
+                try:
+                    spent = await spark_client.daily_sent_sats()
+                except spark_client.CapCheckUnavailable as exc:
+                    raise HTTPException(status_code=503, detail=f"daily cap check unavailable: {exc}")
+                if spent + body.amount_sats > cap:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=f"daily send cap reached: {spent} of {cap} sats spent in the last 24h",
+                    )
             try:
-                spent = await spark_client.daily_sent_sats()
-            except spark_client.CapCheckUnavailable as exc:
-                raise HTTPException(status_code=503, detail=f"daily cap check unavailable: {exc}")
-            if spent + body.amount_sats > cap:
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"daily send cap reached: {spent} of {cap} sats spent in the last 24h",
-                )
+                await spark_client.ensure_ln_address(body.destination)
+            except spark_client.UnsupportedDestination as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            db.start_payout(body.payout_id, body.amount_sats, body.destination)
 
-        try:
-            await spark_client.ensure_ln_address(body.destination)
-        except spark_client.UnsupportedDestination as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-        db.start_payout(body.payout_id, body.amount_sats, body.destination)
-        started = int(time.time()) - 5
-        result = await spark_client.send_lightning(body.destination, body.amount_sats)
-
+        result = await spark_client.send_lightning(
+            body.destination, body.amount_sats, spark_client.payment_key(body.payout_id)
+        )
         if result["tx_id"]:
             db.finish_payout(body.payout_id, "sent", tx_id=result["tx_id"])
-        elif not result["attempted"]:
-            # Nothing left the wallet: let the plugin's retry send it.
-            db.forget_payout(body.payout_id)
         else:
-            found = await spark_client.find_send(body.amount_sats, started)
-            if found is not None:
-                logger.warning("send for payout %s raised but payment %s exists", body.payout_id, found["tx_id"])
-                db.finish_payout(body.payout_id, "sent", tx_id=found["tx_id"])
-                result = {**result, **found, "error": ""}
-            else:
-                db.finish_payout(body.payout_id, "unknown", error=result["error"])
-                result = {**result, "retryable": False, "error": _unknown_error(result["error"])}
+            db.finish_payout(body.payout_id, "pending", error=result["error"])
 
     return PayResponse(
         tx_id=result["tx_id"],
@@ -161,26 +168,11 @@ async def pay(body: PayRequest) -> PayResponse:
     )
 
 
-def _unknown_error(cause: str) -> str:
-    return f"send outcome unknown, check the wallet before paying this again: {cause}"
-
-
-def _replay(existing: dict, body: PayRequest) -> PayResponse:
-    """Answer a repeated payout_id from the ledger without sending anything."""
-    if existing["amount_sats"] != body.amount_sats or existing["destination"] != body.destination:
-        raise HTTPException(status_code=409, detail="payout_id was already used for a different payment")
-    logger.info("payout %s already recorded (state=%s), not sending again", body.payout_id, existing["state"])
-    if existing["state"] == "sent":
-        return PayResponse(tx_id=existing["tx_id"], status="processing", dest_type="ln_address")
-    if existing["state"] == "sending":
-        # A send for this payout is in flight or the service died mid-send.
-        return PayResponse(
-            tx_id="", status="failed", dest_type="ln_address", retryable=False,
-            error=_unknown_error("a previous attempt did not finish"),
-        )
+async def _sent_response(tx_id: str) -> PayResponse:
+    """Answer a payout that already has a payment with that payment's live state."""
+    status = await spark_client.payment_status(tx_id) or "processing"
     return PayResponse(
-        tx_id="", status="failed", dest_type="ln_address", retryable=False,
-        error=_unknown_error(existing["error"] or ""),
+        tx_id=tx_id, status=status, dest_type="ln_address", retryable=status != "failed",
     )
 
 
