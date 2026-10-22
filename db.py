@@ -3,8 +3,9 @@
 Outbox: each row is one terminal event (settled/failed) that must reach
 Moodle. A row is considered done once `delivered_at` is set.
 
-Payout ledger: one row per payout_id the plugin asked us to pay, so a retried
-request never sends a second payment. Payment state itself lives in the SDK.
+Payout ledger: one row per payout_id the plugin asked us to pay, so a retry
+with a different amount or destination is refused and a paid payout answers
+with its payment. Payment state itself lives in the SDK.
 """
 
 from __future__ import annotations
@@ -37,8 +38,8 @@ def _ensure_db() -> None:
             ON webhook_outbox(next_attempt_at)
             WHERE delivered_at IS NULL
         """)
-        # state: 'sending' while the SDK call runs, 'sent' once it returned a
-        # payment, 'unknown' when the send raised and no payment could be found.
+        # state: 'pending' until the SDK returned a payment for this payout,
+        # then 'sent' with its tx_id.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS payouts (
                 payout_id    TEXT PRIMARY KEY,
@@ -121,11 +122,11 @@ def get_payout(payout_id: str) -> dict | None:
 
 
 def start_payout(payout_id: str, amount_sats: int, destination: str) -> None:
-    """Record that a send for payout_id is about to start. Raises
-    sqlite3.IntegrityError if the payout_id is already recorded."""
+    """Record a new payout before its first send. Raises sqlite3.IntegrityError
+    if the payout_id is already recorded."""
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO payouts (payout_id, amount_sats, destination, state) VALUES (?, ?, ?, 'sending')",
+            "INSERT INTO payouts (payout_id, amount_sats, destination, state) VALUES (?, ?, ?, 'pending')",
             (payout_id, amount_sats, destination),
         )
 
@@ -140,13 +141,6 @@ def finish_payout(payout_id: str, state: str, tx_id: str = "", error: str = "") 
             """,
             (state, tx_id or None, error[:500] or None, payout_id),
         )
-
-
-def forget_payout(payout_id: str) -> None:
-    """Drop a payout that failed before any payment was attempted, so the
-    plugin's retry can send it."""
-    with _conn() as conn:
-        conn.execute("DELETE FROM payouts WHERE payout_id = ?", (payout_id,))
 
 
 _ensure_db()

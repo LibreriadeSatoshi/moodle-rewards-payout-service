@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from pathlib import Path
 import breez_sdk_spark as spark
 
@@ -17,6 +18,9 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 _sdk: spark.BreezSdk | None = None
+
+# Fixed namespace so payment_key() maps a payout_id to the same UUID forever.
+_PAYOUT_NAMESPACE = uuid.UUID("6c1f0b9e-3a57-4c39-9d0e-5f2b8a1c7e44")
 
 
 class UnsupportedDestination(Exception):
@@ -104,16 +108,21 @@ async def ensure_ln_address(destination: str) -> None:
         raise UnsupportedDestination("Only Lightning address destinations are supported")
 
 
-async def send_lightning(destination: str, amount_sats: int) -> dict:
+def payment_key(payout_id: str) -> str:
+    """The SDK idempotency key (a UUID) for a payout_id. Stable across restarts."""
+    return str(uuid.uuid5(_PAYOUT_NAMESPACE, payout_id))
+
+
+async def send_lightning(destination: str, amount_sats: int, idempotency_key: str) -> dict:
     """Send a Lightning payment to a Lightning address via the LNURL-pay flow.
 
-    Returns: {tx_id, status, error, retryable, attempted}. `attempted` is False
-    when the send failed before the payment was handed to the SDK (parse or
-    prepare error), so retrying cannot pay twice. When it is True and tx_id is
-    empty, the payment may or may not have gone out.
+    The SDK makes at most one payment per idempotency_key: its storage is
+    checked first and the key doubles as the Spark transfer id, so a repeat
+    returns the original payment instead of paying again. That makes every
+    failure here safe to retry with the same key.
 
-    For terminal outcomes a webhook will follow (from the listener); the caller
-    gets only the *initial* state.
+    Returns: {tx_id, status, error}; tx_id is empty when the send raised. For terminal outcomes a webhook
+    will follow (from the listener); the caller gets only the *initial* state.
     """
     sdk = await connect()
     try:
@@ -123,24 +132,39 @@ async def send_lightning(destination: str, amount_sats: int) -> dict:
         prepare = await sdk.prepare_lnurl_pay(
             request=spark.PrepareLnurlPayRequest(amount=amount_sats, pay_request=parsed[0].pay_request)
         )
-    except Exception as exc:
-        logger.exception("lightning payment preparation failed")
-        return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True, "attempted": False}
-
-    try:
-        response = await sdk.lnurl_pay(request=spark.LnurlPayRequest(prepare_response=prepare))
+        response = await sdk.lnurl_pay(
+            request=spark.LnurlPayRequest(prepare_response=prepare, idempotency_key=idempotency_key)
+        )
     except Exception as exc:
         logger.exception("lightning payment failed")
-        return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True, "attempted": True}
+        return {"tx_id": "", "status": "failed", "error": str(exc)}
 
     payment = response.payment
-    return {
-        "tx_id": payment.id or "",
-        "status": _map_status(payment.status),
-        "error": "",
-        "retryable": True,
-        "attempted": True,
-    }
+    return {"tx_id": payment.id or "", "status": _map_status(payment.status), "error": ""}
+
+
+class PaymentLookupUnavailable(Exception):
+    """Raised when the SDK can't say whether a payment exists."""
+
+
+async def find_payment(payment_id: str) -> dict | None:
+    """{tx_id, status} of a payment, or None if the wallet has no such payment.
+
+    A payment sent with an idempotency key has that key as its id. Raises
+    PaymentLookupUnavailable on any other SDK error, so callers never mistake
+    an unreadable wallet for a missing payment.
+    """
+    sdk = await connect()
+    try:
+        response = await sdk.get_payment(request=spark.GetPaymentRequest(payment_id=payment_id))
+    except Exception as exc:
+        # SDK 0.25 storage reports a missing row as "Query returned no rows".
+        if "no rows" in str(exc).lower():
+            return None
+        logger.exception("get_payment failed for %s", payment_id)
+        raise PaymentLookupUnavailable(str(exc)) from exc
+    payment = response.payment
+    return {"tx_id": payment.id, "status": _map_status(payment.status)}
 
 
 async def create_deposit_invoice(amount_sats: int, description: str) -> dict:
@@ -200,26 +224,6 @@ async def daily_sent_sats() -> int:
         logger.exception("list_payments failed during daily-cap check")
         raise CapCheckUnavailable(str(exc)) from exc
     return sum(int(p.amount or 0) for p in payments if p.status != spark.PaymentStatus.FAILED)
-
-
-async def find_send(amount_sats: int, since: int) -> dict | None:
-    """Newest non-failed outbound payment of amount_sats since `since`, if any.
-
-    Used after a send raised, to tell whether the payment went out anyway.
-    """
-    try:
-        payments = await _sends_since(since)
-    except Exception:
-        logger.exception("list_payments failed while looking for a sent payment")
-        return None
-    matches = [
-        p for p in payments
-        if int(p.amount or 0) == amount_sats and p.status != spark.PaymentStatus.FAILED
-    ]
-    if not matches:
-        return None
-    newest = max(matches, key=lambda p: p.timestamp)
-    return {"tx_id": newest.id, "status": _map_status(newest.status)}
 
 
 async def pending_balances() -> dict:
