@@ -51,11 +51,11 @@ class PayTestCase(unittest.IsolatedAsyncioTestCase):
         self.daily = patch.object(self.spark_client, "daily_sent_sats", AsyncMock(side_effect=self._spent))
         self.check = patch.object(self.spark_client, "ensure_ln_address", AsyncMock(return_value=None))
         self.send = patch.object(self.spark_client, "send_lightning", AsyncMock(side_effect=self._sent))
-        self.status = patch.object(self.spark_client, "payment_status", AsyncMock(return_value="processing"))
+        self.lookup = patch.object(self.spark_client, "find_payment", AsyncMock(return_value=None))
         self.daily_mock = self.daily.start()
         self.check.start()
         self.send_mock = self.send.start()
-        self.status_mock = self.status.start()
+        self.lookup_mock = self.lookup.start()
 
     def tearDown(self):
         patch.stopall()
@@ -66,8 +66,7 @@ class PayTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def _sent(self, destination, amount_sats, idempotency_key):
         self.spent += amount_sats
-        return {"tx_id": f"tx-{self.send_mock.await_count}", "status": "processing",
-                "error": "", "retryable": True}
+        return {"tx_id": f"tx-{self.send_mock.await_count}", "status": "processing", "error": ""}
 
     def sent_keys(self):
         return [call.args[2] for call in self.send_mock.await_args_list]
@@ -80,20 +79,23 @@ class PayTestCase(unittest.IsolatedAsyncioTestCase):
             })
 
 
+RAISED = {"tx_id": "", "status": "failed", "error": "timeout"}
+
+
 class IdempotencyTest(PayTestCase):
     async def test_paid_payout_answers_with_its_payment_without_sending(self):
         first = await self.pay()
-        self.status_mock.return_value = "settled"
+        self.lookup_mock.return_value = {"tx_id": first.json()["tx_id"], "status": "settled"}
         second = await self.pay()
 
         self.assertEqual(self.send_mock.await_count, 1)
         self.assertEqual(second.json()["tx_id"], first.json()["tx_id"])
         self.assertEqual(second.json()["status"], "settled")
-        self.status_mock.assert_awaited_once_with(first.json()["tx_id"])
+        self.lookup_mock.assert_awaited_once_with(first.json()["tx_id"])
 
     async def test_paid_payout_whose_payment_failed_is_final(self):
-        await self.pay()
-        self.status_mock.return_value = "failed"
+        first = await self.pay()
+        self.lookup_mock.return_value = {"tx_id": first.json()["tx_id"], "status": "failed"}
         response = await self.pay()
 
         self.assertEqual(response.json()["status"], "failed")
@@ -107,22 +109,53 @@ class IdempotencyTest(PayTestCase):
         self.assertEqual(response.status_code, 409)
         self.assertEqual(self.send_mock.await_count, 1)
 
-    async def test_failed_send_is_retried_with_the_same_key(self):
-        self.send_mock.side_effect = [
-            {"tx_id": "", "status": "failed", "error": "timeout", "retryable": True},
-            {"tx_id": "tx-original", "status": "processing", "error": "", "retryable": True},
-        ]
-        first = await self.pay()
-        self.spent = 1000  # The cap must not block finishing a payout it already admitted.
+    async def test_send_that_raised_answers_503_and_keeps_the_payout_pending(self):
+        self.send_mock.side_effect = [RAISED]
+        response = await self.pay()
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.db.get_payout("site:1")["state"], "pending")
+
+    async def test_retry_after_a_raised_send_uses_the_same_key(self):
+        self.send_mock.side_effect = [RAISED, {"tx_id": "tx-original", "status": "processing", "error": ""}]
+        await self.pay()
         second = await self.pay()
 
-        self.assertTrue(first.json()["retryable"])
-        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
         self.assertEqual(second.json()["tx_id"], "tx-original")
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
         keys = self.sent_keys()
-        self.assertEqual(keys[0], keys[1])
-        self.assertEqual(keys[0], self.spark_client.payment_key("site:1"))
-        self.assertEqual(self.daily_mock.await_count, 1)
+        self.assertEqual(keys, [self.spark_client.payment_key("site:1")] * 2)
+
+    async def test_retry_finds_a_payment_that_went_out_and_does_not_send(self):
+        self.send_mock.side_effect = [RAISED]
+        await self.pay()
+        key = self.spark_client.payment_key("site:1")
+        self.lookup_mock.return_value = {"tx_id": key, "status": "processing"}
+        second = await self.pay()
+
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(second.json()["tx_id"], key)
+        self.assertEqual(self.send_mock.await_count, 1)
+        self.lookup_mock.assert_awaited_once_with(key)
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
+
+    async def test_retry_faces_the_cap_again(self):
+        self.send_mock.side_effect = [RAISED]
+        await self.pay(amount=600)
+        self.spent = 600
+        second = await self.pay(amount=600)
+
+        self.assertEqual(second.status_code, 429)
+        self.assertEqual(self.send_mock.await_count, 1)
+
+    async def test_retry_when_the_wallet_cannot_be_read_does_not_send(self):
+        self.send_mock.side_effect = [RAISED]
+        await self.pay()
+        self.lookup_mock.side_effect = self.spark_client.PaymentLookupUnavailable("sdk down")
+        second = await self.pay()
+
+        self.assertEqual(second.status_code, 503)
+        self.assertEqual(self.send_mock.await_count, 1)
 
     async def test_each_payout_gets_its_own_key(self):
         await self.pay("site:1")
@@ -276,21 +309,52 @@ class SendLightningTest(unittest.IsolatedAsyncioTestCase):
         await self._send(self._sdk(), key="00000000-0000-0000-0000-00000000abcd")
         self.assertEqual(self.pay_requests[0]["idempotency_key"], "00000000-0000-0000-0000-00000000abcd")
 
-    async def test_sdk_error_is_retryable(self):
+    async def test_sdk_error_returns_no_payment(self):
         result = await self._send(self._sdk(pay_error=RuntimeError("timeout")))
-        self.assertTrue(result["retryable"])
         self.assertEqual(result["tx_id"], "")
+        self.assertIn("timeout", result["error"])
 
-    async def test_failed_payment_is_final(self):
+    async def test_failed_payment_is_reported_failed(self):
         result = await self._send(self._sdk(payment_status=spark.PaymentStatus.FAILED))
         self.assertEqual(result["status"], "failed")
-        self.assertFalse(result["retryable"])
 
     async def test_success_returns_the_payment(self):
         result = await self._send(self._sdk())
         self.assertEqual(result["tx_id"], "tx-1")
         self.assertEqual(result["status"], "processing")
-        self.assertTrue(result["retryable"])
+
+
+class FindPaymentTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        _, _, self.spark_client = _load_modules(self._dir.name)
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    async def _find(self, get_payment):
+        sdk = SimpleNamespace(get_payment=get_payment)
+        with patch.object(self.spark_client, "connect", AsyncMock(return_value=sdk)):
+            return await self.spark_client.find_payment("key")
+
+    async def test_missing_payment_is_none(self):
+        async def get_payment(*, request):
+            raise RuntimeError("StorageError: Query returned no rows")
+
+        self.assertIsNone(await self._find(get_payment))
+
+    async def test_other_errors_are_not_mistaken_for_a_missing_payment(self):
+        async def get_payment(*, request):
+            raise RuntimeError("database is locked")
+
+        with self.assertRaises(self.spark_client.PaymentLookupUnavailable):
+            await self._find(get_payment)
+
+    async def test_existing_payment_is_returned(self):
+        async def get_payment(*, request):
+            return SimpleNamespace(payment=SimpleNamespace(id=request.payment_id, status=spark.PaymentStatus.COMPLETED))
+
+        self.assertEqual(await self._find(get_payment), {"tx_id": "key", "status": "settled"})
 
 
 if __name__ == "__main__":

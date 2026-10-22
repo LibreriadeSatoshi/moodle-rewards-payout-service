@@ -121,7 +121,7 @@ async def send_lightning(destination: str, amount_sats: int, idempotency_key: st
     returns the original payment instead of paying again. That makes every
     failure here safe to retry with the same key.
 
-    Returns: {tx_id, status, error, retryable}. For terminal outcomes a webhook
+    Returns: {tx_id, status, error}; tx_id is empty when the send raised. For terminal outcomes a webhook
     will follow (from the listener); the caller gets only the *initial* state.
     """
     sdk = await connect()
@@ -137,29 +137,34 @@ async def send_lightning(destination: str, amount_sats: int, idempotency_key: st
         )
     except Exception as exc:
         logger.exception("lightning payment failed")
-        return {"tx_id": "", "status": "failed", "error": str(exc), "retryable": True}
+        return {"tx_id": "", "status": "failed", "error": str(exc)}
 
     payment = response.payment
-    status = _map_status(payment.status)
-    return {
-        "tx_id": payment.id or "",
-        "status": status,
-        "error": "",
-        # A payment the SDK reports failed is final for this key: no money left,
-        # and resending the key would only return the same failed payment.
-        "retryable": status != "failed",
-    }
+    return {"tx_id": payment.id or "", "status": _map_status(payment.status), "error": ""}
 
 
-async def payment_status(tx_id: str) -> str | None:
-    """Live status of a payment, or None if the SDK can't say."""
+class PaymentLookupUnavailable(Exception):
+    """Raised when the SDK can't say whether a payment exists."""
+
+
+async def find_payment(payment_id: str) -> dict | None:
+    """{tx_id, status} of a payment, or None if the wallet has no such payment.
+
+    A payment sent with an idempotency key has that key as its id. Raises
+    PaymentLookupUnavailable on any other SDK error, so callers never mistake
+    an unreadable wallet for a missing payment.
+    """
     sdk = await connect()
     try:
-        response = await sdk.get_payment(request=spark.GetPaymentRequest(payment_id=tx_id))
-    except Exception:
-        logger.exception("get_payment failed for %s", tx_id)
-        return None
-    return _map_status(response.payment.status)
+        response = await sdk.get_payment(request=spark.GetPaymentRequest(payment_id=payment_id))
+    except Exception as exc:
+        # SDK 0.25 storage reports a missing row as "Query returned no rows".
+        if "no rows" in str(exc).lower():
+            return None
+        logger.exception("get_payment failed for %s", payment_id)
+        raise PaymentLookupUnavailable(str(exc)) from exc
+    payment = response.payment
+    return {"tx_id": payment.id, "status": _map_status(payment.status)}
 
 
 async def create_deposit_invoice(amount_sats: int, description: str) -> dict:
