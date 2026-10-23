@@ -160,6 +160,8 @@ async def pay(body: PayRequest) -> PayResponse:
             db.finish_payout(body.payout_id, "pending", error=result["error"])
             raise HTTPException(status_code=503, detail=f"send failed, retry later: {result['error']}")
         db.finish_payout(body.payout_id, "sent", tx_id=result["tx_id"])
+        # With idempotency keys the SDK may return an earlier payment whose webhook was given up.
+        db.revive(result["tx_id"])
 
     return _payment_response(result["tx_id"], result["status"])
 

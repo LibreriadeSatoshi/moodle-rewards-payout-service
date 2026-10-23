@@ -109,17 +109,23 @@ def mark_delivered(tx_id: str) -> None:
         )
 
 
-def mark_abandoned(tx_id: str, error: str) -> None:
-    """Stop retrying a delivery. It stays in the outbox for manual review."""
+def mark_abandoned(tx_id: str, error: str, give_up_days: float) -> bool:
+    """Stop retrying a delivery Moodle has answered "tx_id not found" for at
+    least give_up_days. The row stays in the outbox for manual review. Returns
+    False, changing nothing, if the row no longer qualifies (delivered, or
+    revived while the last attempt was in flight)."""
     with _conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
             UPDATE webhook_outbox
             SET attempts = attempts + 1, abandoned_at = datetime('now'), last_error = ?
-            WHERE tx_id = ?
+            WHERE tx_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+              AND rejected_since IS NOT NULL
+              AND julianday('now') - julianday(rejected_since) >= ?
             """,
-            (error[:500], tx_id),
+            (error[:500], tx_id, give_up_days),
         )
+        return cur.rowcount > 0
 
 
 def undelivered(limit: int = 50) -> dict:
@@ -139,7 +145,8 @@ def undelivered(limit: int = 50) -> dict:
 
 def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
     """Increment attempts and push next_attempt_at into the future. not_found
-    starts the give-up clock (rejected_since) if it isn't running yet."""
+    starts the give-up clock (rejected_since) if it isn't running yet; any other
+    failure stops it, so only an unbroken run of "tx_id not found" counts."""
     with _conn() as conn:
         conn.execute(
             """
@@ -148,7 +155,7 @@ def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = 
                 next_attempt_at = datetime('now', ? || ' seconds'),
                 last_error = ?,
                 rejected_since = CASE WHEN ? THEN coalesce(rejected_since, datetime('now'))
-                                      ELSE rejected_since END
+                                      ELSE NULL END
             WHERE tx_id = ?
             """,
             (f"+{backoff_seconds}", error[:500], not_found, tx_id),

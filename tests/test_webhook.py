@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import json
 import os
 import sqlite3
 import sys
@@ -66,10 +67,23 @@ class OutboxTestCase(unittest.TestCase):
             conn.row_factory = sqlite3.Row
             return dict(conn.execute("SELECT * FROM webhook_outbox WHERE tx_id = ?", (tx_id,)).fetchone())
 
-    def deliver_due(self, http_status=404):
-        with patch.object(self.webhook, "_post", return_value=(http_status, '{"error":"tx_id not found"}')):
+    def deliver_due(self, http_status=404, body=None):
+        """One retrier pass; a 404 answers like the plugin does unless `body` is given."""
+        def post(url, payload):
+            if body is not None:
+                return http_status, body
+            tx_id = json.loads(payload)["tx_id"]
+            if http_status == 404:
+                return 404, json.dumps({"error": "tx_id not found", "tx_id": tx_id})
+            return http_status, "{}"
+
+        with patch.object(self.webhook, "_post", side_effect=post):
             for row in self.db.claim_due():
                 self.webhook._deliver_one(row)
+
+    def make_due(self):
+        with sqlite3.connect(self.db.DB_PATH) as conn:
+            conn.execute("UPDATE webhook_outbox SET next_attempt_at = datetime('now')")
 
 
 class GiveUpTest(OutboxTestCase):
@@ -107,8 +121,7 @@ class GiveUpTest(OutboxTestCase):
             with self.subTest(status=status):
                 self.deliver_due(status)
                 self.assertIsNone(self.row()["abandoned_at"])
-                with sqlite3.connect(self.db.DB_PATH) as conn:
-                    conn.execute("UPDATE webhook_outbox SET next_attempt_at = datetime('now')")
+                self.make_due()
 
     def test_network_failures_are_retried_forever(self):
         self.enqueue(age_days=30, rejected_days=20)
@@ -118,6 +131,38 @@ class GiveUpTest(OutboxTestCase):
 
         self.assertIn("network", self.row()["last_error"])
         self.assertIsNone(self.row()["abandoned_at"])
+
+    def test_other_404s_never_start_the_clock(self):
+        # A wrong MOODLE_WEBHOOK_URL or a missing plugin is a misconfiguration, not "not found".
+        self.enqueue(age_days=30, rejected_days=20)
+        for body in ("<html>404 Not Found</html>", '{"error":"tx_id not found","tx_id":"other"}', "{}"):
+            with self.subTest(body=body):
+                self.deliver_due(404, body=body)
+                self.assertIsNone(self.row()["abandoned_at"])
+                self.assertIsNone(self.row()["rejected_since"])
+                self.make_due()
+
+    def test_any_other_answer_resets_the_clock(self):
+        self.enqueue(age_days=30, rejected_days=20)
+        self.deliver_due(503)
+        self.assertIsNone(self.row()["rejected_since"])
+
+        self.make_due()
+        self.deliver_due(404)
+
+        self.assertIsNone(self.row()["abandoned_at"])
+        self.assertIsNotNone(self.row()["rejected_since"])
+
+    def test_revive_during_the_last_attempt_wins(self):
+        self.enqueue(age_days=9, rejected_days=8)
+        row = self.db.claim_due()[0]
+        self.db.revive("tx-1")  # /pay asks about the payout while the POST is in flight.
+
+        with patch.object(self.webhook, "_post", return_value=(404, json.dumps({"error": "tx_id not found", "tx_id": "tx-1"}))):
+            self.webhook._deliver_one(row)
+
+        self.assertIsNone(self.row()["abandoned_at"])
+        self.assertIsNotNone(self.row()["rejected_since"])
 
     def test_zero_days_retries_forever(self):
         self.enqueue(age_days=400, rejected_days=400)
