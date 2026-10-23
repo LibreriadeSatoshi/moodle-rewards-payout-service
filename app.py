@@ -144,6 +144,7 @@ async def pay(body: PayRequest) -> PayResponse:
                 raise HTTPException(status_code=503, detail=f"payment lookup unavailable: {exc}")
             if found is not None:
                 db.finish_payout(body.payout_id, "sent", tx_id=found["tx_id"])
+                db.revive(found["tx_id"])
                 return _payment_response(found["tx_id"], found["status"])
 
         await _check_cap(body.amount_sats)
@@ -186,7 +187,12 @@ def _payment_response(tx_id: str, status: str) -> PayResponse:
 
 
 async def _sent_response(tx_id: str) -> PayResponse:
-    """Answer a payout that already has a payment with that payment's live state."""
+    """Answer a payout that already has a payment with that payment's live state.
+
+    Moodle is asking about this payout again, so it will now store the tx_id:
+    retry its webhook from scratch in case the retrier had given up on it.
+    """
+    db.revive(tx_id)
     try:
         found = await spark_client.find_payment(tx_id)
     except spark_client.PaymentLookupUnavailable:

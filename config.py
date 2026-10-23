@@ -28,10 +28,11 @@ class Settings(BaseSettings):
     # the blast radius is one day's quota instead of the entire wallet.
     daily_send_cap_sats: int = 0
 
-    # Days to keep retrying a webhook Moodle won't accept before giving up on it
-    # and logging an error. 0 retries forever. Early 404s are normal (the event
-    # can arrive before Moodle has stored the payment's tx_id), so keep this
-    # well above the backoff cap of one hour.
+    # Days Moodle may keep answering 404 (no payout with this tx_id) before the
+    # retrier gives up on the event and logs an error. 0 retries forever. Early
+    # 404s are normal (the event can arrive before Moodle has stored the tx_id),
+    # so keep this well above the backoff cap of one hour. Other failures are
+    # always retried.
     webhook_give_up_days: float = 7
 
     # Uvicorn.

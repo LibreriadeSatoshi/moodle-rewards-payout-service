@@ -3,9 +3,11 @@
 The retrier runs on a background thread. On each tick it drains any due rows
 from db.webhook_outbox, POSTs them to MOODLE_WEBHOOK_URL with a signature
 header, and either marks them delivered or pushes next_attempt_at forward
-using capped exponential backoff. Retries until 2xx, or gives up after
-WEBHOOK_GIVE_UP_DAYS and logs an error; given-up rows stay in the outbox and
-are listed by GET /webhooks/undelivered.
+using capped exponential backoff. Retries until 2xx. The one answer it gives up
+on is a 404 (Moodle has no payout with this tx_id) that has lasted
+WEBHOOK_GIVE_UP_DAYS: it logs an error and keeps the row, listed by
+GET /webhooks/undelivered. Network errors, 5xx and other rejections are retried
+forever, so an outage on either side never drops an event Moodle needs.
 """
 
 from __future__ import annotations
@@ -94,7 +96,7 @@ def _deliver_one(row: dict) -> None:
     try:
         status, resp_text = _post(settings.moodle_webhook_url, body)
     except Exception as exc:
-        _record_failure(row, f"network: {exc}")
+        _record_failure(row, f"network: {exc}", not_found=False)
         return
 
     if 200 <= status < 300:
@@ -102,23 +104,25 @@ def _deliver_one(row: dict) -> None:
         db.mark_delivered(tx_id)
         return
 
-    _record_failure(row, f"HTTP {status}: {resp_text[:200]}")
+    _record_failure(row, f"HTTP {status}: {resp_text[:200]}", not_found=status == 404)
 
 
-def _record_failure(row: dict, err: str) -> None:
-    """Schedule a retry, or give up once the event is older than the limit."""
+def _record_failure(row: dict, err: str, not_found: bool) -> None:
+    """Schedule a retry, or give up on an event Moodle has answered 404 for
+    longer than WEBHOOK_GIVE_UP_DAYS."""
     tx_id = row["tx_id"]
     give_up_days = settings.webhook_give_up_days
-    if give_up_days > 0 and row["age_days"] >= give_up_days:
+    rejected_days = row["rejected_days"]
+    if not_found and give_up_days > 0 and rejected_days is not None and rejected_days >= give_up_days:
         logger.error(
-            "webhook %s given up after %d attempts over %.1f days, needs manual review: %s",
-            tx_id, row["attempts"] + 1, row["age_days"], err,
+            "webhook %s given up: Moodle has answered 404 for %.1f days (%d attempts), needs manual review: %s",
+            tx_id, rejected_days, row["attempts"] + 1, err,
         )
         db.mark_abandoned(tx_id, err)
         return
     delay = _backoff(row["attempts"])
     logger.warning("webhook %s failed: %s, retry in %ds", tx_id, err, delay)
-    db.mark_failed(tx_id, delay, err)
+    db.mark_failed(tx_id, delay, err, not_found=not_found)
 
 
 class Retrier:

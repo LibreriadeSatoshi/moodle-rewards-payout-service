@@ -10,7 +10,7 @@ The wallet is a Breez SDK Spark wallet. Only Lightning addresses
 
 ```
 plugin  ──POST /pay──▶  service     auth: X-Internal-Token
-plugin  ◀POST /webhook  service     auth: HMAC-SHA256, retried up to WEBHOOK_GIVE_UP_DAYS
+plugin  ◀POST /webhook  service     auth: HMAC-SHA256, retried until 2xx (404s give up after WEBHOOK_GIVE_UP_DAYS)
 ```
 
 The service verifies the destination is a Lightning address via the SDK,
@@ -65,7 +65,7 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests   # tests
 | `MOODLE_WEBHOOK_URL`  | Where to POST terminal events. Plugin endpoint: `…/local/btcrewards/webhook.php`. |
 | `HOST`, `PORT`        | uvicorn bind. Defaults `0.0.0.0:3000`.                                         |
 | `DAILY_SEND_CAP_SATS` | Optional rolling 24h spending ceiling, also the largest single payout. Fails closed. |
-| `WEBHOOK_GIVE_UP_DAYS` | Days to retry a webhook Moodle rejects before giving up (default 7, 0 = forever). |
+| `WEBHOOK_GIVE_UP_DAYS` | Days Moodle may answer 404 for a webhook before the service gives up on it (default 7, 0 = forever). |
 | `MOCK_BTC_USD_RATE`   | Optional fallback rate; only used if Spark `list_fiat_rates` fails.            |
 
 `.env` and `data/` are gitignored. `.env.example` is the tracked template.
@@ -109,13 +109,17 @@ seconds). The plugin verifies:
 - `tx_id` is known and `status` is one of `settled` or `failed`.
 
 The service retries non-2xx answers with exponential backoff (capped at one
-hour) and the plugin must be idempotent by `tx_id`. Early 404s are normal: the
-event can arrive before Moodle has stored the payment's `tx_id`. After
-`WEBHOOK_GIVE_UP_DAYS` (default 7) the service gives up on the event, logs an
-error ("given up … needs manual review") and keeps the row in the outbox with
+hour) and the plugin must be idempotent by `tx_id`. Network errors, 5xx and
+other rejections are retried forever, so an outage on either side never drops
+an event. The one answer it gives up on is HTTP 404 (Moodle has no payout with
+this `tx_id`): early 404s are normal, since the event can arrive before Moodle
+has stored the `tx_id`, but once Moodle has answered 404 for
+`WEBHOOK_GIVE_UP_DAYS` (default 7, counted from the first 404) the service logs
+an error ("given up … needs manual review") and keeps the row with
 `abandoned_at` set. `GET /webhooks/undelivered` lists rows still retrying and
-rows given up. To retry one after fixing the cause, clear its `abandoned_at`
-in `data/outbox.db`.
+rows given up. If Moodle calls `/pay` again for that payout, the event is
+retried from scratch; to retry one by hand, clear its `abandoned_at` and
+`rejected_since` in `data/outbox.db`.
 
 ## Constraints
 

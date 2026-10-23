@@ -33,10 +33,12 @@ def _ensure_db() -> None:
                 created_at       TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
-        # Added after the first release: rows the retrier gave up on.
+        # Added after the first release. rejected_since: when Moodle first answered
+        # 404 (no payout with this tx_id). abandoned_at: when the retrier gave up.
         columns = {row[1] for row in conn.execute("PRAGMA table_info(webhook_outbox)")}
-        if "abandoned_at" not in columns:
-            conn.execute("ALTER TABLE webhook_outbox ADD COLUMN abandoned_at TEXT")
+        for column in ("rejected_since", "abandoned_at"):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE webhook_outbox ADD COLUMN {column} TEXT")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_outbox_pending
             ON webhook_outbox(next_attempt_at)
@@ -81,12 +83,13 @@ def enqueue(tx_id: str, status: str, payload: dict) -> bool:
 
 def claim_due(limit: int = 20) -> list[dict]:
     """Return up-to-limit outbox rows due for delivery (not delivered, not
-    abandoned, next_attempt_at <= now), each with its age in days."""
+    abandoned, next_attempt_at <= now), each with the days since Moodle first
+    answered 404 for it (None if it never did)."""
     with _conn() as conn:
         rows = conn.execute(
             """
             SELECT tx_id, status, payload_json, attempts,
-                   julianday('now') - julianday(created_at) AS age_days
+                   julianday('now') - julianday(rejected_since) AS rejected_days
             FROM webhook_outbox
             WHERE delivered_at IS NULL AND abandoned_at IS NULL
               AND next_attempt_at <= datetime('now')
@@ -122,7 +125,7 @@ def mark_abandoned(tx_id: str, error: str) -> None:
 def undelivered(limit: int = 50) -> dict:
     """Deliveries still being retried and deliveries given up on, oldest first."""
     query = """
-        SELECT tx_id, status, attempts, created_at, abandoned_at, last_error
+        SELECT tx_id, status, attempts, created_at, rejected_since, abandoned_at, last_error
         FROM webhook_outbox
         WHERE delivered_at IS NULL AND abandoned_at IS {} NULL
         ORDER BY created_at
@@ -134,18 +137,35 @@ def undelivered(limit: int = 50) -> dict:
     return {"retrying": [dict(r) for r in retrying], "abandoned": [dict(r) for r in abandoned]}
 
 
-def mark_failed(tx_id: str, backoff_seconds: int, error: str) -> None:
-    """Increment attempts and push next_attempt_at into the future."""
+def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
+    """Increment attempts and push next_attempt_at into the future. not_found
+    starts the give-up clock (rejected_since) if it isn't running yet."""
     with _conn() as conn:
         conn.execute(
             """
             UPDATE webhook_outbox
             SET attempts = attempts + 1,
                 next_attempt_at = datetime('now', ? || ' seconds'),
-                last_error = ?
+                last_error = ?,
+                rejected_since = CASE WHEN ? THEN coalesce(rejected_since, datetime('now'))
+                                      ELSE rejected_since END
             WHERE tx_id = ?
             """,
-            (f"+{backoff_seconds}", error[:500], tx_id),
+            (f"+{backoff_seconds}", error[:500], not_found, tx_id),
+        )
+
+
+def revive(tx_id: str) -> None:
+    """Retry an undelivered event from scratch: Moodle is asking about its
+    payout again, so it may know the tx_id now."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE webhook_outbox
+            SET abandoned_at = NULL, rejected_since = NULL, next_attempt_at = datetime('now')
+            WHERE tx_id = ? AND delivered_at IS NULL
+            """,
+            (tx_id,),
         )
 
 

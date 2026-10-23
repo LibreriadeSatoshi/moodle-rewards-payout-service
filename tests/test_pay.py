@@ -93,6 +93,28 @@ class IdempotencyTest(PayTestCase):
         self.assertEqual(second.json()["status"], "settled")
         self.lookup_mock.assert_awaited_once_with(first.json()["tx_id"])
 
+    async def test_asking_about_a_paid_payout_again_revives_its_webhook(self):
+        first = await self.pay()
+        tx_id = first.json()["tx_id"]
+        self.db.enqueue(tx_id, "settled", {"tx_id": tx_id})
+        self.db.mark_abandoned(tx_id, "HTTP 404")
+
+        await self.pay()
+
+        self.assertEqual([r["tx_id"] for r in self.db.claim_due()], [tx_id])
+
+    async def test_payout_found_in_the_wallet_on_retry_revives_its_webhook(self):
+        self.send_mock.side_effect = [RAISED]
+        await self.pay()
+        key = self.spark_client.payment_key("site:1")
+        self.db.enqueue(key, "settled", {"tx_id": key})
+        self.db.mark_abandoned(key, "HTTP 404")
+        self.lookup_mock.return_value = {"tx_id": key, "status": "settled"}
+
+        await self.pay()
+
+        self.assertEqual([r["tx_id"] for r in self.db.claim_due()], [key])
+
     async def test_paid_payout_whose_payment_failed_is_final(self):
         first = await self.pay()
         self.lookup_mock.return_value = {"tx_id": first.json()["tx_id"], "status": "failed"}

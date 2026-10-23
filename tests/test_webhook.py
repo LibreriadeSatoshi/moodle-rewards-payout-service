@@ -47,13 +47,19 @@ class OutboxTestCase(unittest.TestCase):
         patch.stopall()
         self._dir.cleanup()
 
-    def enqueue(self, tx_id="tx-1", age_days=0.0):
+    def enqueue(self, tx_id="tx-1", age_days=0.0, rejected_days=None):
+        """An event created age_days ago; rejected_days: since Moodle first answered 404."""
         self.db.enqueue(tx_id, "settled", {"tx_id": tx_id, "status": "settled", "amount_sats": 10})
         with sqlite3.connect(self.db.DB_PATH) as conn:
             conn.execute(
                 "UPDATE webhook_outbox SET created_at = datetime('now', ?) WHERE tx_id = ?",
                 (f"-{age_days * 86400:.0f} seconds", tx_id),
             )
+            if rejected_days is not None:
+                conn.execute(
+                    "UPDATE webhook_outbox SET rejected_since = datetime('now', ?) WHERE tx_id = ?",
+                    (f"-{rejected_days * 86400:.0f} seconds", tx_id),
+                )
 
     def row(self, tx_id="tx-1"):
         with sqlite3.connect(self.db.DB_PATH) as conn:
@@ -67,20 +73,20 @@ class OutboxTestCase(unittest.TestCase):
 
 
 class GiveUpTest(OutboxTestCase):
-    def test_recent_rejection_is_retried_later(self):
+    def test_first_404_is_retried_and_starts_the_clock(self):
         self.enqueue(age_days=1)
-        self.deliver_due()
+        self.deliver_due(404)
 
         row = self.row()
         self.assertEqual(row["attempts"], 1)
+        self.assertIsNotNone(row["rejected_since"])
         self.assertIsNone(row["abandoned_at"])
-        self.assertIsNone(row["delivered_at"])
         self.assertIn("HTTP 404", row["last_error"])
 
-    def test_rejection_older_than_the_limit_is_given_up_and_never_retried(self):
-        self.enqueue(age_days=8)
+    def test_404_lasting_longer_than_the_limit_is_given_up_and_never_retried(self):
+        self.enqueue(age_days=9, rejected_days=8)
         with self.assertLogs("webhook", level="ERROR") as logs:
-            self.deliver_due()
+            self.deliver_due(404)
 
         row = self.row()
         self.assertIsNotNone(row["abandoned_at"])
@@ -88,30 +94,64 @@ class GiveUpTest(OutboxTestCase):
         self.assertIn("given up", logs.output[0])
         self.assertEqual(self.db.claim_due(), [])
 
-    def test_network_failures_also_give_up_after_the_limit(self):
-        self.enqueue(age_days=8)
+    def test_old_event_is_not_given_up_on_its_first_404(self):
+        # The service was down for a month: the clock starts at the first 404, not at creation.
+        self.enqueue(age_days=30)
+        self.deliver_due(404)
+
+        self.assertIsNone(self.row()["abandoned_at"])
+
+    def test_moodle_outage_is_retried_forever(self):
+        self.enqueue(age_days=30, rejected_days=20)
+        for status in (500, 502, 401):
+            with self.subTest(status=status):
+                self.deliver_due(status)
+                self.assertIsNone(self.row()["abandoned_at"])
+                with sqlite3.connect(self.db.DB_PATH) as conn:
+                    conn.execute("UPDATE webhook_outbox SET next_attempt_at = datetime('now')")
+
+    def test_network_failures_are_retried_forever(self):
+        self.enqueue(age_days=30, rejected_days=20)
         with patch.object(self.webhook, "_post", side_effect=OSError("connection refused")):
-            with self.assertLogs("webhook", level="ERROR"):
-                for row in self.db.claim_due():
-                    self.webhook._deliver_one(row)
+            for row in self.db.claim_due():
+                self.webhook._deliver_one(row)
 
         self.assertIn("network", self.row()["last_error"])
-        self.assertIsNotNone(self.row()["abandoned_at"])
+        self.assertIsNone(self.row()["abandoned_at"])
 
     def test_zero_days_retries_forever(self):
-        self.enqueue(age_days=400)
+        self.enqueue(age_days=400, rejected_days=400)
         with patch.object(self.webhook.settings, "webhook_give_up_days", 0):
-            self.deliver_due()
+            self.deliver_due(404)
 
         self.assertIsNone(self.row()["abandoned_at"])
         self.assertEqual(self.row()["attempts"], 1)
 
     def test_accepted_delivery_is_marked_delivered(self):
-        self.enqueue(age_days=8)
-        self.deliver_due(http_status=200)
+        self.enqueue(age_days=8, rejected_days=1)
+        self.deliver_due(200)
 
         self.assertIsNotNone(self.row()["delivered_at"])
         self.assertIsNone(self.row()["abandoned_at"])
+
+    def test_revive_retries_a_given_up_event_from_scratch(self):
+        self.enqueue(age_days=9, rejected_days=8)
+        with self.assertLogs("webhook", level="ERROR"):
+            self.deliver_due(404)
+
+        self.db.revive("tx-1")
+
+        row = self.row()
+        self.assertIsNone(row["abandoned_at"])
+        self.assertIsNone(row["rejected_since"])
+        self.assertEqual([r["tx_id"] for r in self.db.claim_due()], ["tx-1"])
+
+    def test_revive_leaves_delivered_events_alone(self):
+        self.enqueue()
+        self.db.mark_delivered("tx-1")
+        self.db.revive("tx-1")
+
+        self.assertEqual(self.db.claim_due(), [])
 
 
 class MigrationTest(unittest.TestCase):
@@ -145,7 +185,7 @@ class UndeliveredEndpointTest(OutboxTestCase):
 
     def test_lists_retrying_and_given_up_deliveries(self):
         self.enqueue("tx-new", age_days=1)
-        self.enqueue("tx-old", age_days=8)
+        self.enqueue("tx-old", age_days=9, rejected_days=8)
         self.enqueue("tx-done", age_days=1)
         with self.assertLogs("webhook", level="ERROR"):
             self.deliver_due()
