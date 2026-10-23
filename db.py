@@ -33,6 +33,12 @@ def _ensure_db() -> None:
                 created_at       TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # Added after the first release. rejected_since: when Moodle first answered
+        # 404 (no payout with this tx_id). abandoned_at: when the retrier gave up.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(webhook_outbox)")}
+        for column in ("rejected_since", "abandoned_at"):
+            if column not in columns:
+                conn.execute(f"ALTER TABLE webhook_outbox ADD COLUMN {column} TEXT")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_outbox_pending
             ON webhook_outbox(next_attempt_at)
@@ -76,14 +82,17 @@ def enqueue(tx_id: str, status: str, payload: dict) -> bool:
 
 
 def claim_due(limit: int = 20) -> list[dict]:
-    """Return up-to-limit outbox rows due for delivery (delivered_at IS NULL,
-    next_attempt_at <= now)."""
+    """Return up-to-limit outbox rows due for delivery (not delivered, not
+    abandoned, next_attempt_at <= now), each with the days since Moodle first
+    answered 404 for it (None if it never did)."""
     with _conn() as conn:
         rows = conn.execute(
             """
-            SELECT tx_id, status, payload_json, attempts
+            SELECT tx_id, status, payload_json, attempts,
+                   julianday('now') - julianday(rejected_since) AS rejected_days
             FROM webhook_outbox
-            WHERE delivered_at IS NULL AND next_attempt_at <= datetime('now')
+            WHERE delivered_at IS NULL AND abandoned_at IS NULL
+              AND next_attempt_at <= datetime('now')
             ORDER BY next_attempt_at
             LIMIT ?
             """,
@@ -100,18 +109,70 @@ def mark_delivered(tx_id: str) -> None:
         )
 
 
-def mark_failed(tx_id: str, backoff_seconds: int, error: str) -> None:
-    """Increment attempts and push next_attempt_at into the future."""
+def mark_abandoned(tx_id: str, error: str, give_up_days: float) -> bool:
+    """Stop retrying a delivery Moodle has answered "tx_id not found" for at
+    least give_up_days. The row stays in the outbox for manual review. Returns
+    False, changing nothing, if the row no longer qualifies (delivered, or
+    revived while the last attempt was in flight)."""
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE webhook_outbox
+            SET attempts = attempts + 1, abandoned_at = datetime('now'), last_error = ?
+            WHERE tx_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+              AND rejected_since IS NOT NULL
+              AND julianday('now') - julianday(rejected_since) >= ?
+            """,
+            (error[:500], tx_id, give_up_days),
+        )
+        return cur.rowcount > 0
+
+
+def undelivered(limit: int = 50) -> dict:
+    """Deliveries still being retried and deliveries given up on, oldest first."""
+    query = """
+        SELECT tx_id, status, attempts, created_at, rejected_since, abandoned_at, last_error
+        FROM webhook_outbox
+        WHERE delivered_at IS NULL AND abandoned_at IS {} NULL
+        ORDER BY created_at
+        LIMIT ?
+    """
+    with _conn() as conn:
+        retrying = conn.execute(query.format(""), (limit,)).fetchall()
+        abandoned = conn.execute(query.format("NOT"), (limit,)).fetchall()
+    return {"retrying": [dict(r) for r in retrying], "abandoned": [dict(r) for r in abandoned]}
+
+
+def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
+    """Increment attempts and push next_attempt_at into the future. not_found
+    starts the give-up clock (rejected_since) if it isn't running yet; any other
+    failure stops it, so only an unbroken run of "tx_id not found" counts."""
     with _conn() as conn:
         conn.execute(
             """
             UPDATE webhook_outbox
             SET attempts = attempts + 1,
                 next_attempt_at = datetime('now', ? || ' seconds'),
-                last_error = ?
+                last_error = ?,
+                rejected_since = CASE WHEN ? THEN coalesce(rejected_since, datetime('now'))
+                                      ELSE NULL END
             WHERE tx_id = ?
             """,
-            (f"+{backoff_seconds}", error[:500], tx_id),
+            (f"+{backoff_seconds}", error[:500], not_found, tx_id),
+        )
+
+
+def revive(tx_id: str) -> None:
+    """Retry an undelivered event from scratch: Moodle is asking about its
+    payout again, so it may know the tx_id now."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE webhook_outbox
+            SET abandoned_at = NULL, rejected_since = NULL, next_attempt_at = datetime('now')
+            WHERE tx_id = ? AND delivered_at IS NULL
+            """,
+            (tx_id,),
         )
 
 

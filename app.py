@@ -7,6 +7,7 @@ Contract:
   GET  /status/{tx_id}       → live SDK state (debug)
   GET  /balance              → wallet balance (debug)
   GET  /rate                 → BTC/USD rate in cents
+  GET  /webhooks/undelivered → webhook deliveries still retrying or given up
   Webhook (outbound)         → Moodle receives terminal events, retried until 2xx
 """
 
@@ -143,6 +144,7 @@ async def pay(body: PayRequest) -> PayResponse:
                 raise HTTPException(status_code=503, detail=f"payment lookup unavailable: {exc}")
             if found is not None:
                 db.finish_payout(body.payout_id, "sent", tx_id=found["tx_id"])
+                db.revive(found["tx_id"])
                 return _payment_response(found["tx_id"], found["status"])
 
         await _check_cap(body.amount_sats)
@@ -158,6 +160,8 @@ async def pay(body: PayRequest) -> PayResponse:
             db.finish_payout(body.payout_id, "pending", error=result["error"])
             raise HTTPException(status_code=503, detail=f"send failed, retry later: {result['error']}")
         db.finish_payout(body.payout_id, "sent", tx_id=result["tx_id"])
+        # With idempotency keys the SDK may return an earlier payment whose webhook was given up.
+        db.revive(result["tx_id"])
 
     return _payment_response(result["tx_id"], result["status"])
 
@@ -185,7 +189,12 @@ def _payment_response(tx_id: str, status: str) -> PayResponse:
 
 
 async def _sent_response(tx_id: str) -> PayResponse:
-    """Answer a payout that already has a payment with that payment's live state."""
+    """Answer a payout that already has a payment with that payment's live state.
+
+    Moodle is asking about this payout again, so it will now store the tx_id:
+    retry its webhook from scratch in case the retrier had given up on it.
+    """
+    db.revive(tx_id)
     try:
         found = await spark_client.find_payment(tx_id)
     except spark_client.PaymentLookupUnavailable:
@@ -214,6 +223,13 @@ async def get_status(tx_id: str) -> StatusResponse:
     if info is None:
         raise HTTPException(status_code=404, detail="tx_id not found")
     return StatusResponse(**info)
+
+
+@app.get("/webhooks/undelivered", dependencies=[auth_required])
+def webhooks_undelivered():
+    """Webhook deliveries Moodle hasn't accepted: still retrying, or given up
+    after WEBHOOK_GIVE_UP_DAYS and waiting for manual review."""
+    return db.undelivered()
 
 
 @app.get("/health")
