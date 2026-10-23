@@ -71,14 +71,35 @@ def _conn():
         conn.close()
 
 
-def enqueue(tx_id: str, status: str, payload: dict) -> bool:
-    """Insert a delivery. Idempotent by tx_id — returns True if inserted."""
+def enqueue(tx_id: str, status: str, payload: dict) -> str:
+    """Queue a delivery, idempotent by tx_id. Returns "inserted", "upgraded" or "".
+
+    A "settled" event replaces an earlier "failed" one for the same payment,
+    delivered or not, and is delivered from scratch: Spark can report a
+    Lightning send failed and later completed (the preimage arrives late), and
+    then the money did leave. Nothing ever replaces a "settled" event.
+    """
+    body = json.dumps(payload, sort_keys=True)
     with _conn() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO webhook_outbox (tx_id, status, payload_json) VALUES (?, ?, ?)",
-            (tx_id, status, json.dumps(payload, sort_keys=True)),
+            (tx_id, status, body),
         )
-        return cur.rowcount > 0
+        if cur.rowcount > 0:
+            return "inserted"
+        if status != "settled":
+            return ""
+        cur = conn.execute(
+            """
+            UPDATE webhook_outbox
+            SET status = 'settled', payload_json = ?, attempts = 0,
+                next_attempt_at = datetime('now'), delivered_at = NULL, last_error = NULL,
+                rejected_since = NULL, abandoned_at = NULL
+            WHERE tx_id = ? AND status = 'failed'
+            """,
+            (body, tx_id),
+        )
+        return "upgraded" if cur.rowcount > 0 else ""
 
 
 def claim_due(limit: int = 20) -> list[dict]:
@@ -101,15 +122,17 @@ def claim_due(limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def mark_delivered(tx_id: str) -> None:
+def mark_delivered(tx_id: str, status: str) -> None:
+    """Mark the `status` event for tx_id delivered. A no-op if the row was
+    replaced by another status while it was being delivered."""
     with _conn() as conn:
         conn.execute(
-            "UPDATE webhook_outbox SET delivered_at = datetime('now') WHERE tx_id = ?",
-            (tx_id,),
+            "UPDATE webhook_outbox SET delivered_at = datetime('now') WHERE tx_id = ? AND status = ?",
+            (tx_id, status),
         )
 
 
-def mark_abandoned(tx_id: str, error: str, give_up_days: float) -> bool:
+def mark_abandoned(tx_id: str, status: str, error: str, give_up_days: float) -> bool:
     """Stop retrying a delivery Moodle has answered "tx_id not found" for at
     least give_up_days. The row stays in the outbox for manual review. Returns
     False, changing nothing, if the row no longer qualifies (delivered, or
@@ -119,11 +142,11 @@ def mark_abandoned(tx_id: str, error: str, give_up_days: float) -> bool:
             """
             UPDATE webhook_outbox
             SET attempts = attempts + 1, abandoned_at = datetime('now'), last_error = ?
-            WHERE tx_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+            WHERE tx_id = ? AND status = ? AND delivered_at IS NULL AND abandoned_at IS NULL
               AND rejected_since IS NOT NULL
               AND julianday('now') - julianday(rejected_since) >= ?
             """,
-            (error[:500], tx_id, give_up_days),
+            (error[:500], tx_id, status, give_up_days),
         )
         return cur.rowcount > 0
 
@@ -143,7 +166,7 @@ def undelivered(limit: int = 50) -> dict:
     return {"retrying": [dict(r) for r in retrying], "abandoned": [dict(r) for r in abandoned]}
 
 
-def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
+def mark_failed(tx_id: str, status: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
     """Increment attempts and push next_attempt_at into the future. not_found
     starts the give-up clock (rejected_since) if it isn't running yet; any other
     failure stops it, so only an unbroken run of "tx_id not found" counts."""
@@ -156,9 +179,9 @@ def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = 
                 last_error = ?,
                 rejected_since = CASE WHEN ? THEN coalesce(rejected_since, datetime('now'))
                                       ELSE NULL END
-            WHERE tx_id = ?
+            WHERE tx_id = ? AND status = ?
             """,
-            (f"+{backoff_seconds}", error[:500], not_found, tx_id),
+            (f"+{backoff_seconds}", error[:500], not_found, tx_id, status),
         )
 
 

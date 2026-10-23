@@ -49,9 +49,11 @@ class _Listener(spark.EventListener):
         if not tx_id:
             return
         payload = payload_for(payment, status)
-        inserted = db.enqueue(tx_id, status, payload)
-        if inserted:
+        outcome = db.enqueue(tx_id, status, payload)
+        if outcome == "inserted":
             logger.info("Enqueued webhook for tx_id=%s status=%s", tx_id, status)
+        elif outcome == "upgraded":
+            logger.warning("Payment %s reported failed earlier is now settled: delivering settled", tx_id)
 
 
 def _get_network() -> spark.Network:

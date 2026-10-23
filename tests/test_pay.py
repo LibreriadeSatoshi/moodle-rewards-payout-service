@@ -96,8 +96,8 @@ class IdempotencyTest(PayTestCase):
     def abandon(self, tx_id):
         """An undelivered webhook the retrier has given up on."""
         self.db.enqueue(tx_id, "settled", {"tx_id": tx_id})
-        self.db.mark_failed(tx_id, 0, "HTTP 404", not_found=True)
-        self.assertTrue(self.db.mark_abandoned(tx_id, "HTTP 404", 0))
+        self.db.mark_failed(tx_id, "settled", 0, "HTTP 404", not_found=True)
+        self.assertTrue(self.db.mark_abandoned(tx_id, "settled", "HTTP 404", 0))
         self.assertEqual(self.db.claim_due(), [])
 
     async def test_send_returning_an_earlier_payment_revives_its_webhook(self):
