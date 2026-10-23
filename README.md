@@ -135,6 +135,11 @@ seconds). The plugin verifies:
 - `|now - timestamp|` is within 5 minutes (replay window).
 - `tx_id` is known and `status` is one of `settled` or `failed`.
 
+Each payment gets at most one queued event, except that a `settled` event
+replaces an earlier `failed` one (delivered or not) and is delivered again:
+Spark can report a Lightning send failed and later completed, once the
+preimage arrives, and then the money did leave. Nothing replaces `settled`.
+
 The service retries non-2xx answers with exponential backoff (capped at one
 hour) and the plugin must be idempotent by `tx_id`. Network errors, 5xx and
 other rejections are retried forever, so an outage on either side never drops

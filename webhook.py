@@ -102,7 +102,7 @@ def _deliver_one(row: dict) -> None:
 
     if 200 <= status < 300:
         logger.info("webhook %s delivered (HTTP %d)", tx_id, status)
-        db.mark_delivered(tx_id)
+        db.mark_delivered(tx_id, row["status"])
         return
 
     _record_failure(
@@ -132,7 +132,7 @@ def _record_failure(row: dict, err: str, not_found: bool) -> None:
     if (
         not_found and give_up_days > 0 and rejected_days is not None and rejected_days >= give_up_days
         # Re-checked in the UPDATE: a revive during the POST wins over this snapshot.
-        and db.mark_abandoned(tx_id, err, give_up_days)
+        and db.mark_abandoned(tx_id, row["status"], err, give_up_days)
     ):
         logger.error(
             "webhook %s given up: Moodle has answered 'tx_id not found' for %.1f days (%d attempts), "
@@ -142,7 +142,7 @@ def _record_failure(row: dict, err: str, not_found: bool) -> None:
         return
     delay = _backoff(row["attempts"])
     logger.warning("webhook %s failed: %s, retry in %ds", tx_id, err, delay)
-    db.mark_failed(tx_id, delay, err, not_found=not_found)
+    db.mark_failed(tx_id, row["status"], delay, err, not_found=not_found)
 
 
 class Retrier:
