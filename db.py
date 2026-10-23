@@ -61,6 +61,18 @@ def _ensure_db() -> None:
                 updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # Every invoice a payout has had (it gets a new one only after the
+        # previous one expired), so the receiver can be asked about each.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payout_invoices (
+                payment_hash TEXT PRIMARY KEY,
+                payout_id    TEXT NOT NULL,
+                invoice      TEXT NOT NULL,
+                verify_url   TEXT,
+                expires_at   INTEGER NOT NULL,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
         # Added after the first release: the invoice each payout pays, and
         # its receiver-side verification.
         payout_columns = {row[1] for row in conn.execute("PRAGMA table_info(payouts)")}
@@ -232,8 +244,16 @@ def start_payout(
 
 
 def set_invoice(payout_id: str, invoice: dict) -> None:
-    """Store the invoice a payout pays: {invoice, payment_hash, verify_url, expires_at}."""
+    """Store the invoice a payout pays: {invoice, payment_hash, verify_url, expires_at}.
+    Earlier invoices stay in payout_invoices."""
     with _conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO payout_invoices (payment_hash, payout_id, invoice, verify_url, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (invoice["payment_hash"], payout_id, invoice["invoice"], invoice["verify_url"], invoice["expires_at"]),
+        )
         conn.execute(
             """
             UPDATE payouts
@@ -267,6 +287,21 @@ def record_sent(payout_id: str, tx_id: str) -> None:
             """,
             (tx_id, payout_id),
         )
+
+
+def set_tx_id_if_missing(payout_id: str, tx_id: str) -> None:
+    """Payouts recorded before tx_id was set at creation get it before their next send."""
+    with _conn() as conn:
+        conn.execute("UPDATE payouts SET tx_id = ? WHERE payout_id = ? AND tx_id IS NULL", (tx_id, payout_id))
+
+
+def invoices(payout_id: str) -> list[dict]:
+    """Every invoice a payout has had, oldest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM payout_invoices WHERE payout_id = ? ORDER BY created_at, rowid", (payout_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_payout_by_tx(tx_id: str) -> dict | None:
@@ -307,14 +342,37 @@ def resolve_verifying(payout_id: str, state: str, preimage: str = "") -> bool:
         return cur.rowcount > 0
 
 
+def mark_paid(payout_id: str, preimage: str = "") -> bool:
+    """The payment turned out paid after all ('verifying' or 'failed' → 'sent').
+    Returns False if the payout was in neither state."""
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE payouts
+            SET state = 'sent', preimage = coalesce(?, preimage), updated_at = datetime('now')
+            WHERE payout_id = ? AND state IN ('verifying', 'failed')
+            """,
+            (preimage or None, payout_id),
+        )
+        return cur.rowcount > 0
+
+
 def verifying(limit: int = 100) -> list[dict]:
-    """Payouts waiting for the receiver's word, oldest first, with the hours waited."""
+    """Payouts to ask the receiver about, oldest first, with the hours waited:
+    'verifying' ones, and 'failed' ones until a day after their last invoice
+    expires, because a payment in flight can still settle until then."""
     with _conn() as conn:
         rows = conn.execute(
             """
-            SELECT *, (julianday('now') - julianday(unconfirmed_since)) * 24 AS hours_unconfirmed
-            FROM payouts WHERE state = 'verifying'
-            ORDER BY unconfirmed_since
+            SELECT p.*, (julianday('now') - julianday(p.unconfirmed_since)) * 24 AS hours_unconfirmed
+            FROM payouts p
+            WHERE p.verify_url IS NOT NULL AND (
+                p.state = 'verifying'
+                OR (p.state = 'failed' AND p.unconfirmed_since IS NOT NULL
+                    AND (SELECT max(expires_at) FROM payout_invoices i WHERE i.payout_id = p.payout_id)
+                        + 86400 > CAST(strftime('%s', 'now') AS INTEGER))
+            )
+            ORDER BY p.unconfirmed_since
             LIMIT ?
             """,
             (limit,),

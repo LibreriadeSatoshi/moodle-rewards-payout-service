@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     # a payment still in flight settles or fails well within that.
     verify_interval_seconds: float = 300
     verify_fail_after_hours: float = 24
+    # Lightning address callbacks and verify URLs are fetched over https only,
+    # and never from private or internal addresses. Allow those for a local
+    # regtest setup only.
+    allow_private_lnurl: bool = False
 
     # Uvicorn.
     host: str = "0.0.0.0"

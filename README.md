@@ -69,6 +69,7 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests   # tests
 | `WEBHOOK_GIVE_UP_DAYS` | Days Moodle may answer "tx_id not found" for a webhook, without interruption, before the service gives up on it (default 7, 0 = forever). |
 | `VERIFY_INTERVAL_SECONDS` | How often payouts the SDK reported failed are checked with the receiver (default 300). |
 | `VERIFY_FAIL_AFTER_HOURS` | Hours the receiver must keep saying "not paid" before a payout is reported failed (default 24). |
+| `ALLOW_PRIVATE_LNURL` | Allow Lightning address callbacks and verify URLs on private addresses (local regtest only; default false). |
 | `MOCK_BTC_USD_RATE`   | Optional fallback rate; only used if Spark `list_fiat_rates` fails.            |
 
 `.env` and `data/` are gitignored. `.env.example` is the tracked template.
@@ -114,15 +115,24 @@ invoice is only replaced once it has expired with no payment under the key.
 
 When the SDK reports the payment failed and the payout has a verify URL, the
 payout becomes `verifying`: `/pay` answers `processing` and no failed webhook
-is sent. Every `VERIFY_INTERVAL_SECONDS` (default 300) the service asks the
-verify URL:
+is sent. A separate thread asks the receiver every `VERIFY_INTERVAL_SECONDS`
+(default 300), about every invoice the payout has had:
 
-- paid, with a preimage that hashes to the invoice's payment hash: the payout
+- paid, with a preimage that hashes to that invoice's payment hash: the payout
   is `sent` and Moodle gets a `settled` webhook carrying the preimage;
 - still not paid after `VERIFY_FAIL_AFTER_HOURS` (default 24): `failed` and a
-  `failed` webhook;
+  `failed` webhook. Failed payouts are still watched until a day after their
+  last invoice expires; if one turns out paid, the `settled` webhook replaces
+  the `failed` one and Moodle turns the payout PAID (or flags it if its points
+  were already released);
 - no trustworthy answer (unreachable, error, settled without valid preimage):
-  nothing changes, the payout keeps waiting.
+  nothing changes, the payout keeps waiting. `GET /webhooks/undelivered` lists
+  payouts waiting under `verifying`.
+
+Callbacks and verify URLs come from outside, so they are fetched over https
+only, without following redirects, never from a private, loopback or
+link-local address (`ALLOW_PRIVATE_LNURL=true` lifts that for a local regtest
+setup), with a 20 s deadline and a 64 KiB limit per request.
 
 Payouts whose address has no verify URL keep the SDK's verdict.
 

@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -120,11 +121,56 @@ class IsPaidTest(ReceiptsTestCase):
                         self.receipts.is_paid("https://v", PAYMENT_HASH)
 
 
+class SafeFetchTest(ReceiptsTestCase):
+    def resolve(self, address):
+        return patch.object(self.receipts.socket, "getaddrinfo", return_value=[(None, None, None, None, (address, 443))])
+
+    def test_only_https_to_public_addresses_is_fetched(self):
+        cases = {
+            "http://pay.example/x": None,
+            "file:///etc/passwd": None,
+            "https://pay.example/x": "10.10.10.102",
+            "https://pay.example/y": "127.0.0.1",
+            "https://pay.example/z": "169.254.1.1",
+            "https://pay.example/w": "fd00::1",
+        }
+        for url, address in cases.items():
+            with self.subTest(url=url, address=address):
+                with self.resolve(address or "1.1.1.1"):
+                    with self.assertRaises(ValueError):
+                        self.receipts._check_url(url)
+        with self.resolve("1.1.1.1"):
+            self.receipts._check_url("https://pay.example/ok")
+
+    def test_redirects_are_not_followed(self):
+        handler = self.receipts._NoRedirect()
+        request = SimpleNamespace(full_url="https://pay.example/x")
+        with self.assertRaises(self.receipts.urllib.error.HTTPError):
+            handler.redirect_request(request, None, 302, "Found", {}, "https://10.0.0.1/")
+
+    def test_oversized_answer_is_refused(self):
+        class Response:
+            def __init__(self):
+                self.left = 10
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def read(self, n):
+                self.left -= 1
+                return b"x" * 8192 if self.left > 0 else b""
+
+        with self.resolve("1.1.1.1"), patch.object(self.receipts._opener, "open", return_value=Response()):
+            with self.assertRaises(ValueError):
+                self.receipts._get_json("https://pay.example/big")
+
+
 class CheckVerifyingTest(ReceiptsTestCase):
-    def verifying_payout(self, hours=1.0, payout_id="site:1", tx_id="key-1"):
+    def verifying_payout(self, hours=1.0, payout_id="site:1", tx_id="key-1", expires_at=None):
         self.db.start_payout(payout_id, 10, "student@pay.example", {
             "invoice": "lnbc1", "payment_hash": PAYMENT_HASH,
-            "verify_url": "https://pay.example/verify/x", "expires_at": 0,
+            "verify_url": "https://pay.example/verify/x",
+            "expires_at": expires_at if expires_at is not None else int(time.time()) + 30 * 86400,
         }, tx_id=tx_id)
         self.assertTrue(self.db.mark_verifying(payout_id))
         with sqlite3.connect(self.db.DB_PATH) as conn:
@@ -181,6 +227,59 @@ class CheckVerifyingTest(ReceiptsTestCase):
         self.assertFalse(self.db.mark_verifying("site:1"))
 
 
+class LateSettlementTest(CheckVerifyingTest):
+    def reported_failed(self, expires_at=None):
+        self.verifying_payout(hours=25, expires_at=expires_at)
+        with patch.object(self.receipts, "is_paid", return_value=None):
+            self.receipts.check_verifying()
+        self.assertEqual(self.db.get_payout("site:1")["state"], "failed")
+
+    def test_payment_settling_after_the_failed_report_is_delivered_as_settled(self):
+        self.reported_failed()
+        with patch.object(self.receipts, "is_paid", return_value=PREIMAGE):
+            self.receipts.check_verifying()
+
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
+        [(tx_id, status, payload)] = self.outbox()
+        self.assertEqual((status, payload["preimage"]), ("settled", PREIMAGE))
+
+    def test_failed_payout_is_no_longer_watched_a_day_after_its_invoice_expired(self):
+        self.reported_failed(expires_at=int(time.time()) - 2 * 86400)
+        with patch.object(self.receipts, "is_paid", return_value=PREIMAGE) as is_paid:
+            self.receipts.check_verifying()
+
+        is_paid.assert_not_called()
+        self.assertEqual(self.db.get_payout("site:1")["state"], "failed")
+
+    def test_any_earlier_invoice_paid_counts_as_paid(self):
+        self.verifying_payout(hours=25)
+        self.db.set_invoice("site:1", {"invoice": "lnbc2", "payment_hash": "hash-2",
+                                       "verify_url": "https://pay.example/verify/2", "expires_at": 0})
+
+        def answer(verify_url, payment_hash):
+            return PREIMAGE if payment_hash == PAYMENT_HASH else None
+
+        with patch.object(self.receipts, "is_paid", side_effect=answer):
+            self.receipts.check_verifying()
+
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
+
+    def test_one_unanswered_invoice_keeps_the_payout_waiting(self):
+        self.verifying_payout(hours=25)
+        self.db.set_invoice("site:1", {"invoice": "lnbc2", "payment_hash": "hash-2",
+                                       "verify_url": "https://pay.example/verify/2", "expires_at": 0})
+
+        def answer(verify_url, payment_hash):
+            if payment_hash == PAYMENT_HASH:
+                raise self.receipts.VerifyUnavailable("down")
+            return None
+
+        with patch.object(self.receipts, "is_paid", side_effect=answer), self.assertLogs("receipts", "WARNING"):
+            self.receipts.check_verifying()
+
+        self.assertEqual(self.db.get_payout("site:1")["state"], "verifying")
+
+
 class ListenerTest(ReceiptsTestCase):
     def event(self, tx_id, failed=True):
         payment = SimpleNamespace(id=tx_id, payment_type=spark.PaymentType.SEND, amount=10)
@@ -215,6 +314,19 @@ class ListenerTest(ReceiptsTestCase):
         self.deliver(self.event("key-1"))
 
         self.assertEqual(self.outbox_statuses(), ["failed"])
+
+    def test_succeeded_event_closes_a_verifying_payout(self):
+        self.db.start_payout("site:1", 10, "student@pay.example", {
+            "invoice": "lnbc1", "payment_hash": PAYMENT_HASH,
+            "verify_url": "https://pay.example/verify/x", "expires_at": 0,
+        }, tx_id="key-1")
+        self.db.mark_verifying("site:1")
+
+        with self.assertLogs("spark_client", level="WARNING"):
+            self.deliver(self.event("key-1", failed=False))
+
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
+        self.assertEqual(self.outbox_statuses(), ["settled"])
 
     def test_succeeded_event_is_sent_to_moodle(self):
         self.db.start_payout("site:1", 10, "student@pay.example", {

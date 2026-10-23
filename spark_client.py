@@ -57,6 +57,10 @@ class _Listener(spark.EventListener):
                 if db.mark_verifying(payout["payout_id"]):
                     logger.warning("Payment %s reported failed: verifying with the receiver", tx_id)
                 return
+        else:
+            payout = db.get_payout_by_tx(tx_id)
+            if payout is not None and db.mark_paid(payout["payout_id"]):
+                logger.warning("Payment %s reported failed earlier now succeeded", tx_id)
         payload = payload_for(payment, status)
         outcome = db.enqueue(tx_id, status, payload)
         if outcome == "inserted":

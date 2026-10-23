@@ -38,7 +38,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(application: FastAPI):
     await spark_client.connect()
     retrier.start()
+    receipts.checker.start()
     yield
+    receipts.checker.stop()
     retrier.stop()
     await spark_client.disconnect()
 
@@ -159,10 +161,15 @@ async def pay(body: PayRequest) -> PayResponse:
         if payout is None:
             invoice = await _new_invoice(body.destination, body.amount_sats)
             db.start_payout(body.payout_id, body.amount_sats, body.destination, invoice, tx_id=key)
-        elif not payout["invoice"] or payout["expires_at"] <= time.time() + INVOICE_MIN_LIFETIME_SECONDS:
-            # No invoice yet (payout from before invoices were stored), or it expired
-            # unpaid: no payment exists under this key, so a new invoice is safe.
-            db.set_invoice(body.payout_id, await _new_invoice(body.destination, body.amount_sats))
+        else:
+            # Payouts recorded before tx_id was set at creation get it now, so
+            # events for this send are matched to the payout.
+            db.set_tx_id_if_missing(body.payout_id, key)
+            if not payout["invoice"] or payout["expires_at"] <= time.time():
+                # No invoice yet (payout from before invoices were stored), or it
+                # expired: no payment exists under this key, so a new invoice is
+                # safe. The old one stays in payout_invoices and is still verified.
+                db.set_invoice(body.payout_id, await _new_invoice(body.destination, body.amount_sats))
         payout = db.get_payout(body.payout_id)
 
         result = await spark_client.send_invoice(payout["invoice"], key)
@@ -170,10 +177,6 @@ async def pay(body: PayRequest) -> PayResponse:
             db.finish_payout(body.payout_id, "pending", error=result["error"])
             raise HTTPException(status_code=503, detail=f"send failed, retry later: {result['error']}")
         return _record_payment(payout, result)
-
-
-# An invoice about to expire is replaced before paying, so the payment has time to route.
-INVOICE_MIN_LIFETIME_SECONDS = 300
 
 
 async def _new_invoice(destination: str, amount_sats: int) -> dict:
@@ -293,8 +296,13 @@ async def get_status(tx_id: str) -> StatusResponse:
 @app.get("/webhooks/undelivered", dependencies=[auth_required])
 def webhooks_undelivered():
     """Webhook deliveries Moodle hasn't accepted: still retrying, or given up
-    after WEBHOOK_GIVE_UP_DAYS and waiting for manual review."""
-    return db.undelivered()
+    after WEBHOOK_GIVE_UP_DAYS and waiting for manual review. Also the payouts
+    the SDK reported failed that are still waiting for the receiver's word."""
+    waiting = [
+        {key: p[key] for key in ("payout_id", "tx_id", "state", "amount_sats", "unconfirmed_since", "hours_unconfirmed")}
+        for p in db.verifying()
+    ]
+    return {**db.undelivered(), "verifying": waiting}
 
 
 @app.get("/health")

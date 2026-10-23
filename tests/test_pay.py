@@ -279,6 +279,22 @@ class InvoiceTest(PayTestCase):
         self.assertEqual(self.sent_invoices(), [fake_invoice(1, 100), fake_invoice(2, 100)])
         self.assertEqual(self.sent_keys()[0], self.sent_keys()[1])
 
+    async def test_invoice_close_to_expiry_is_not_replaced(self):
+        self.send_mock.side_effect = [RAISED, {"tx_id": "k", "status": "processing", "error": ""}]
+        await self.pay()
+        with sqlite3.connect(self.db.DB_PATH) as conn:
+            conn.execute("UPDATE payouts SET expires_at = ?", (int(time.time()) + 60,))
+        await self.pay()
+
+        self.assertEqual(self.sent_invoices(), [fake_invoice(1, 100)] * 2)
+
+    async def test_legacy_pending_payout_gets_its_payment_id_before_sending(self):
+        self.db.start_payout("site:1", 100, DEST)  # Recorded before tx_id was set at creation.
+        await self.pay()
+
+        self.assertEqual(self.db.get_payout("site:1")["tx_id"], self.spark_client.payment_key("site:1"))
+        self.assertEqual(len(self.db.invoices("site:1")), 1)
+
     async def test_invoice_that_does_not_match_is_never_paid(self):
         self.request_mock.side_effect = lambda callback, amount: {
             "invoice": fake_invoice(1, amount + 1), "verify_url": None}
@@ -330,6 +346,15 @@ class VerificationTest(PayTestCase):
         self.assertEqual(response.json()["status"], "failed")
         self.assertFalse(response.json()["retryable"])
         self.assertEqual(self.send_mock.await_count, 1)
+
+    async def test_waiting_payouts_are_listed_for_review(self):
+        self.send_mock.side_effect = [{"tx_id": "k", "status": "failed", "error": ""}]
+        await self.pay()
+        transport = httpx.ASGITransport(app=self.app_module.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            body = (await client.get("/webhooks/undelivered", headers=AUTH)).json()
+
+        self.assertEqual([p["payout_id"] for p in body["verifying"]], ["site:1"])
 
     async def test_receiver_confirmed_payout_stays_settled_whatever_the_sdk_says(self):
         self.send_mock.side_effect = [{"tx_id": "k", "status": "failed", "error": ""}]
