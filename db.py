@@ -21,6 +21,9 @@ DB_PATH = Path("data/outbox.db")
 def _ensure_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as conn:
+        # Readers don't block the writer: the event listener, /pay and the two
+        # background threads each write with their own connection.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS webhook_outbox (
                 tx_id            TEXT PRIMARY KEY,
@@ -76,7 +79,8 @@ def _ensure_db() -> None:
         # Added after the first release: the invoice each payout pays, and
         # its receiver-side verification.
         payout_columns = {row[1] for row in conn.execute("PRAGMA table_info(payouts)")}
-        for column in ("invoice", "payment_hash", "verify_url", "expires_at", "unconfirmed_since", "preimage"):
+        for column in ("invoice", "payment_hash", "verify_url", "expires_at", "unconfirmed_since", "preimage",
+                       "paid_at", "last_checked_at"):
             if column not in payout_columns:
                 kind = "INTEGER" if column == "expires_at" else "TEXT"
                 conn.execute(f"ALTER TABLE payouts ADD COLUMN {column} {kind}")
@@ -304,6 +308,19 @@ def invoices(payout_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def invoice_owner(payment_hash: str) -> str | None:
+    """The payout an invoice was already given to, if any."""
+    with _conn() as conn:
+        row = conn.execute("SELECT payout_id FROM payout_invoices WHERE payment_hash = ?", (payment_hash,)).fetchone()
+    return row[0] if row else None
+
+
+def mark_checked(payout_id: str) -> None:
+    """The receiver was asked about this payout: it goes to the back of the queue."""
+    with _conn() as conn:
+        conn.execute("UPDATE payouts SET last_checked_at = datetime('now') WHERE payout_id = ?", (payout_id,))
+
+
 def get_payout_by_tx(tx_id: str) -> dict | None:
     with _conn() as conn:
         row = conn.execute("SELECT * FROM payouts WHERE tx_id = ?", (tx_id,)).fetchone()
@@ -320,7 +337,7 @@ def mark_verifying(payout_id: str) -> bool:
             UPDATE payouts
             SET state = 'verifying', unconfirmed_since = coalesce(unconfirmed_since, datetime('now')),
                 updated_at = datetime('now')
-            WHERE payout_id = ? AND state IN ('sent', 'pending') AND preimage IS NULL
+            WHERE payout_id = ? AND state IN ('sent', 'pending') AND preimage IS NULL AND paid_at IS NULL
             """,
             (payout_id,),
         )
@@ -349,7 +366,8 @@ def mark_paid(payout_id: str, preimage: str = "") -> bool:
         cur = conn.execute(
             """
             UPDATE payouts
-            SET state = 'sent', preimage = coalesce(?, preimage), updated_at = datetime('now')
+            SET state = 'sent', preimage = coalesce(?, preimage), paid_at = datetime('now'),
+                updated_at = datetime('now')
             WHERE payout_id = ? AND state IN ('verifying', 'failed')
             """,
             (preimage or None, payout_id),
@@ -372,7 +390,7 @@ def verifying(limit: int = 100) -> list[dict]:
                     AND (SELECT max(expires_at) FROM payout_invoices i WHERE i.payout_id = p.payout_id)
                         + 86400 > CAST(strftime('%s', 'now') AS INTEGER))
             )
-            ORDER BY p.unconfirmed_since
+            ORDER BY p.last_checked_at IS NOT NULL, p.last_checked_at, p.unconfirmed_since
             LIMIT ?
             """,
             (limit,),

@@ -156,6 +156,7 @@ def check_verifying() -> None:
     "unknown" must never become "failed".
     """
     for payout in db.verifying():
+        db.mark_checked(payout["payout_id"])
         try:
             preimage = _receiver_answer(payout)
         except VerifyUnavailable as exc:

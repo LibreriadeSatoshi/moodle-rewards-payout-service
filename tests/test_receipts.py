@@ -165,7 +165,7 @@ class SafeFetchTest(ReceiptsTestCase):
                 self.receipts._get_json("https://pay.example/big")
 
 
-class CheckVerifyingTest(ReceiptsTestCase):
+class VerifyingTestCase(ReceiptsTestCase):
     def verifying_payout(self, hours=1.0, payout_id="site:1", tx_id="key-1", expires_at=None):
         self.db.start_payout(payout_id, 10, "student@pay.example", {
             "invoice": "lnbc1", "payment_hash": PAYMENT_HASH,
@@ -182,6 +182,8 @@ class CheckVerifyingTest(ReceiptsTestCase):
             return [(r[0], r[1], json.loads(r[2])) for r in
                     conn.execute("SELECT tx_id, status, payload_json FROM webhook_outbox")]
 
+
+class CheckVerifyingTest(VerifyingTestCase):
     def test_receiver_confirms_payment_settled_webhook_with_preimage(self):
         self.verifying_payout()
         with patch.object(self.receipts, "is_paid", return_value=PREIMAGE):
@@ -227,7 +229,39 @@ class CheckVerifyingTest(ReceiptsTestCase):
         self.assertFalse(self.db.mark_verifying("site:1"))
 
 
-class LateSettlementTest(CheckVerifyingTest):
+class FairnessTest(VerifyingTestCase):
+    def test_least_recently_checked_payouts_come_first(self):
+        self.verifying_payout(payout_id="site:old", tx_id="key-old")
+        self.verifying_payout(payout_id="site:new", tx_id="key-new")
+        self.db.mark_checked("site:old")
+
+        self.assertEqual([p["payout_id"] for p in self.db.verifying()], ["site:new", "site:old"])
+
+    def test_a_check_moves_the_payout_to_the_back(self):
+        self.verifying_payout(payout_id="site:a", tx_id="key-a", hours=2)
+        self.verifying_payout(payout_id="site:b", tx_id="key-b", hours=1)
+        with patch.object(self.receipts, "is_paid", side_effect=self.receipts.VerifyUnavailable("down")), \
+                self.assertLogs("receipts", "WARNING"):
+            self.receipts.check_verifying()
+
+        checked = [p["last_checked_at"] for p in self.db.verifying()]
+        self.assertTrue(all(checked))
+
+
+class PaidStaysPaidTest(ReceiptsTestCase):
+    def test_payout_marked_paid_never_goes_back_to_verifying(self):
+        self.db.start_payout("site:1", 10, "student@pay.example", {
+            "invoice": "lnbc1", "payment_hash": PAYMENT_HASH,
+            "verify_url": "https://pay.example/verify/x", "expires_at": 0,
+        }, tx_id="key-1")
+        self.db.mark_verifying("site:1")
+        self.assertTrue(self.db.mark_paid("site:1"))  # A Succeeded event, no preimage.
+
+        self.assertFalse(self.db.mark_verifying("site:1"))
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
+
+
+class LateSettlementTest(VerifyingTestCase):
     def reported_failed(self, expires_at=None):
         self.verifying_payout(hours=25, expires_at=expires_at)
         with patch.object(self.receipts, "is_paid", return_value=None):

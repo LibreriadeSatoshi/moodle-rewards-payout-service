@@ -304,6 +304,16 @@ class InvoiceTest(PayTestCase):
         self.send_mock.assert_not_awaited()
         self.assertIsNone(self.db.get_payout("site:1"))
 
+    async def test_invoice_already_given_to_another_payout_is_refused(self):
+        await self.pay("site:1")
+        self.request_mock.side_effect = lambda callback, amount: {
+            "invoice": fake_invoice(1, amount), "verify_url": "https://pay.example/verify/1"}
+        response = await self.pay("site:2")
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(self.send_mock.await_count, 1)
+        self.assertIsNone(self.db.get_payout("site:2"))
+
     async def test_unreachable_address_server_is_retried_later(self):
         self.request_mock.side_effect = self.receipts.InvoiceUnavailable("down")
         response = await self.pay()

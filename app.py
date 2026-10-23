@@ -159,7 +159,7 @@ async def pay(body: PayRequest) -> PayResponse:
 
         await _check_cap(body.amount_sats)
         if payout is None:
-            invoice = await _new_invoice(body.destination, body.amount_sats)
+            invoice = await _new_invoice(body.payout_id, body.destination, body.amount_sats)
             db.start_payout(body.payout_id, body.amount_sats, body.destination, invoice, tx_id=key)
         else:
             # Payouts recorded before tx_id was set at creation get it now, so
@@ -169,7 +169,7 @@ async def pay(body: PayRequest) -> PayResponse:
                 # No invoice yet (payout from before invoices were stored), or it
                 # expired: no payment exists under this key, so a new invoice is
                 # safe. The old one stays in payout_invoices and is still verified.
-                db.set_invoice(body.payout_id, await _new_invoice(body.destination, body.amount_sats))
+                db.set_invoice(body.payout_id, await _new_invoice(body.payout_id, body.destination, body.amount_sats))
         payout = db.get_payout(body.payout_id)
 
         result = await spark_client.send_invoice(payout["invoice"], key)
@@ -179,7 +179,7 @@ async def pay(body: PayRequest) -> PayResponse:
         return _record_payment(payout, result)
 
 
-async def _new_invoice(destination: str, amount_sats: int) -> dict:
+async def _new_invoice(payout_id: str, destination: str, amount_sats: int) -> dict:
     """Get and check an invoice for amount_sats from a Lightning address."""
     try:
         details = await spark_client.pay_request(destination)
@@ -196,6 +196,11 @@ async def _new_invoice(destination: str, amount_sats: int) -> dict:
         receipts.check_invoice(invoice, amount_sats, details.metadata_str)
     except receipts.InvalidInvoice as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+    owner = db.invoice_owner(invoice.payment_hash)
+    if owner is not None and owner != payout_id:
+        # Paying it would fail, and its verify URL would vouch for the other
+        # payout's payment: this payout would look paid without being paid.
+        raise HTTPException(status_code=502, detail="the Lightning address returned an invoice already used")
     return {
         "invoice": answer["invoice"],
         "payment_hash": invoice.payment_hash,
