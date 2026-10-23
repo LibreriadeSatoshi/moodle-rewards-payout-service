@@ -28,7 +28,7 @@ def _load_modules(directory: str):
     with patch.dict(os.environ, ENV):
         try:
             os.chdir(directory)
-            for name in ("config", "db", "spark_client", "webhook", "rate", "app"):
+            for name in ("config", "db", "receipts", "spark_client", "webhook", "rate", "app"):
                 sys.modules.pop(name, None)
             db = importlib.import_module("db")
             db.DB_PATH = Path(directory) / "data" / "outbox.db"

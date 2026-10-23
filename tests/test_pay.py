@@ -1,8 +1,11 @@
 """POST /pay: pays a payout at most once, validates amounts, and keeps the daily cap closed."""
 
 import asyncio
+import hashlib
 import importlib
+import time
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -24,6 +27,7 @@ ENV = {
 }
 AUTH = {"X-Internal-Token": "secret-token"}
 DEST = "student@pay.example"
+META = '[["text/identifier","student@pay.example"]]'
 
 
 def _load_modules(directory: str):
@@ -32,7 +36,7 @@ def _load_modules(directory: str):
     with patch.dict(os.environ, ENV):
         try:
             os.chdir(directory)
-            for name in ("config", "db", "spark_client", "webhook", "rate", "app"):
+            for name in ("config", "db", "receipts", "spark_client", "webhook", "rate", "app"):
                 sys.modules.pop(name, None)
             db = importlib.import_module("db")
             db.DB_PATH = Path(directory) / "data" / "outbox.db"
@@ -43,19 +47,36 @@ def _load_modules(directory: str):
     return app, db, sys.modules["spark_client"]
 
 
+def fake_invoice(n: int, amount_sats: int) -> str:
+    return f"lnbc-{n}-{amount_sats}"
+
+
+def fake_details(invoice: str, expiry: int = 3600):
+    _, n, amount = invoice.split("-")
+    return SimpleNamespace(
+        amount_msat=int(amount) * 1000,
+        description_hash=hashlib.sha256(META.encode()).hexdigest(),
+        payment_hash=f"hash-{n}",
+        timestamp=int(time.time()),
+        expiry=expiry,
+    )
+
+
 class PayTestCase(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         self.app_module, self.db, self.spark_client = _load_modules(self._dir.name)
+        self.receipts = sys.modules["receipts"]
         self.spent = 0
-        self.daily = patch.object(self.spark_client, "daily_sent_sats", AsyncMock(side_effect=self._spent))
-        self.check = patch.object(self.spark_client, "ensure_ln_address", AsyncMock(return_value=None))
-        self.send = patch.object(self.spark_client, "send_lightning", AsyncMock(side_effect=self._sent))
-        self.lookup = patch.object(self.spark_client, "find_payment", AsyncMock(return_value=None))
-        self.daily_mock = self.daily.start()
-        self.check.start()
-        self.send_mock = self.send.start()
-        self.lookup_mock = self.lookup.start()
+        self.invoices = 0
+        self.daily_mock = patch.object(
+            self.spark_client, "daily_sent_sats", AsyncMock(side_effect=self._spent)).start()
+        patch.object(self.spark_client, "pay_request", AsyncMock(return_value=SimpleNamespace(
+            callback="https://pay.example/cb", min_sendable=1000, max_sendable=10**11, metadata_str=META))).start()
+        self.request_mock = patch.object(self.receipts, "request_invoice", side_effect=self._invoice).start()
+        patch.object(self.spark_client, "invoice_details", AsyncMock(side_effect=fake_details)).start()
+        self.send_mock = patch.object(self.spark_client, "send_invoice", AsyncMock(side_effect=self._sent)).start()
+        self.lookup_mock = patch.object(self.spark_client, "find_payment", AsyncMock(return_value=None)).start()
 
     def tearDown(self):
         patch.stopall()
@@ -64,12 +85,20 @@ class PayTestCase(unittest.IsolatedAsyncioTestCase):
     async def _spent(self):
         return self.spent
 
-    async def _sent(self, destination, amount_sats, idempotency_key):
-        self.spent += amount_sats
-        return {"tx_id": f"tx-{self.send_mock.await_count}", "status": "processing", "error": ""}
+    def _invoice(self, callback, amount_sats):
+        self.invoices += 1
+        return {"invoice": fake_invoice(self.invoices, amount_sats),
+                "verify_url": f"https://pay.example/verify/{self.invoices}"}
+
+    async def _sent(self, invoice, idempotency_key):
+        self.spent += int(invoice.split("-")[2])
+        return {"tx_id": idempotency_key, "status": "processing", "error": ""}
 
     def sent_keys(self):
-        return [call.args[2] for call in self.send_mock.await_args_list]
+        return [call.args[1] for call in self.send_mock.await_args_list]
+
+    def sent_invoices(self):
+        return [call.args[0] for call in self.send_mock.await_args_list]
 
     async def pay(self, payout_id="site:1", amount=100, destination=DEST, headers=AUTH):
         transport = httpx.ASGITransport(app=self.app_module.app)
@@ -101,10 +130,11 @@ class IdempotencyTest(PayTestCase):
         self.assertEqual(self.db.claim_due(), [])
 
     async def test_send_returning_an_earlier_payment_revives_its_webhook(self):
-        self.abandon("tx-1")
+        key = self.spark_client.payment_key("site:1")
+        self.abandon(key)
         await self.pay()
 
-        self.assertEqual([r["tx_id"] for r in self.db.claim_due()], ["tx-1"])
+        self.assertEqual([r["tx_id"] for r in self.db.claim_due()], [key])
 
     async def test_asking_about_a_paid_payout_again_revives_its_webhook(self):
         first = await self.pay()
@@ -126,14 +156,25 @@ class IdempotencyTest(PayTestCase):
 
         self.assertEqual([r["tx_id"] for r in self.db.claim_due()], [key])
 
-    async def test_paid_payout_whose_payment_failed_is_final(self):
+    async def test_paid_payout_the_sdk_later_reports_failed_is_verified_not_failed(self):
+        first = await self.pay()
+        self.lookup_mock.return_value = {"tx_id": first.json()["tx_id"], "status": "failed"}
+        response = await self.pay()
+
+        self.assertEqual(response.json()["status"], "processing")
+        self.assertTrue(response.json()["retryable"])
+        self.assertEqual(self.db.get_payout("site:1")["state"], "verifying")
+        self.assertEqual(self.send_mock.await_count, 1)
+
+    async def test_without_a_verify_url_a_failed_payment_is_final(self):
+        self.request_mock.side_effect = lambda callback, amount: {
+            "invoice": fake_invoice(1, amount), "verify_url": None}
         first = await self.pay()
         self.lookup_mock.return_value = {"tx_id": first.json()["tx_id"], "status": "failed"}
         response = await self.pay()
 
         self.assertEqual(response.json()["status"], "failed")
         self.assertFalse(response.json()["retryable"])
-        self.assertEqual(self.send_mock.await_count, 1)
 
     async def test_payout_id_reused_for_a_different_payment_is_rejected(self):
         await self.pay(amount=100)
@@ -209,6 +250,98 @@ class IdempotencyTest(PayTestCase):
         self.assertEqual(response.status_code, 422)
 
 
+class InvoiceTest(PayTestCase):
+    async def test_new_payout_stores_its_invoice_verify_url_and_payment_id(self):
+        await self.pay()
+
+        payout = self.db.get_payout("site:1")
+        self.assertEqual(payout["invoice"], fake_invoice(1, 100))
+        self.assertEqual(payout["verify_url"], "https://pay.example/verify/1")
+        self.assertEqual(payout["payment_hash"], "hash-1")
+        self.assertEqual(payout["tx_id"], self.spark_client.payment_key("site:1"))
+        self.assertEqual(self.sent_invoices(), [fake_invoice(1, 100)])
+
+    async def test_retry_pays_the_same_invoice(self):
+        self.send_mock.side_effect = [RAISED, {"tx_id": "k", "status": "processing", "error": ""}]
+        await self.pay()
+        await self.pay()
+
+        self.assertEqual(self.request_mock.call_count, 1)
+        self.assertEqual(self.sent_invoices(), [fake_invoice(1, 100)] * 2)
+
+    async def test_expired_unpaid_invoice_is_replaced_before_retrying(self):
+        self.send_mock.side_effect = [RAISED, {"tx_id": "k", "status": "processing", "error": ""}]
+        await self.pay()
+        with sqlite3.connect(self.db.DB_PATH) as conn:
+            conn.execute("UPDATE payouts SET expires_at = 0")
+        await self.pay()
+
+        self.assertEqual(self.sent_invoices(), [fake_invoice(1, 100), fake_invoice(2, 100)])
+        self.assertEqual(self.sent_keys()[0], self.sent_keys()[1])
+
+    async def test_invoice_that_does_not_match_is_never_paid(self):
+        self.request_mock.side_effect = lambda callback, amount: {
+            "invoice": fake_invoice(1, amount + 1), "verify_url": None}
+        response = await self.pay()
+
+        self.assertEqual(response.status_code, 502)
+        self.send_mock.assert_not_awaited()
+        self.assertIsNone(self.db.get_payout("site:1"))
+
+    async def test_unreachable_address_server_is_retried_later(self):
+        self.request_mock.side_effect = self.receipts.InvoiceUnavailable("down")
+        response = await self.pay()
+
+        self.assertEqual(response.status_code, 503)
+        self.send_mock.assert_not_awaited()
+
+    async def test_amount_outside_the_address_limits_is_rejected(self):
+        self.spark_client.pay_request.return_value = SimpleNamespace(
+            callback="https://pay.example/cb", min_sendable=1000, max_sendable=50_000, metadata_str=META)
+        response = await self.pay(amount=100)
+
+        self.assertEqual(response.status_code, 400)
+        self.send_mock.assert_not_awaited()
+
+
+class VerificationTest(PayTestCase):
+    async def test_send_reported_failed_is_verifying_not_failed(self):
+        self.send_mock.side_effect = [{"tx_id": "k", "status": "failed", "error": ""}]
+        response = await self.pay()
+
+        self.assertEqual(response.json()["status"], "processing")
+        self.assertTrue(response.json()["retryable"])
+        self.assertEqual(self.db.get_payout("site:1")["state"], "verifying")
+
+    async def test_verifying_payout_is_answered_without_sending(self):
+        self.send_mock.side_effect = [{"tx_id": "k", "status": "failed", "error": ""}]
+        await self.pay()
+        response = await self.pay()
+
+        self.assertEqual(response.json()["status"], "processing")
+        self.assertEqual(self.send_mock.await_count, 1)
+
+    async def test_failed_after_verification_is_final(self):
+        self.send_mock.side_effect = [{"tx_id": "k", "status": "failed", "error": ""}]
+        await self.pay()
+        self.db.resolve_verifying("site:1", "failed")
+        response = await self.pay()
+
+        self.assertEqual(response.json()["status"], "failed")
+        self.assertFalse(response.json()["retryable"])
+        self.assertEqual(self.send_mock.await_count, 1)
+
+    async def test_receiver_confirmed_payout_stays_settled_whatever_the_sdk_says(self):
+        self.send_mock.side_effect = [{"tx_id": "k", "status": "failed", "error": ""}]
+        await self.pay()
+        self.db.resolve_verifying("site:1", "sent", "aa" * 32)
+        self.lookup_mock.return_value = {"tx_id": "k", "status": "failed"}
+        response = await self.pay()
+
+        self.assertEqual(response.json()["status"], "settled")
+        self.assertEqual(self.db.get_payout("site:1")["state"], "sent")
+
+
 class LimitsTest(PayTestCase):
     async def test_zero_and_negative_amounts_are_rejected(self):
         for amount in (0, -5):
@@ -236,9 +369,9 @@ class LimitsTest(PayTestCase):
         self.assertIsNone(self.db.get_payout("site:1"))
 
     async def test_concurrent_payouts_cannot_both_slip_under_the_cap(self):
-        async def slow_send(destination, amount_sats, idempotency_key):
+        async def slow_send(invoice, idempotency_key):
             await asyncio.sleep(0.05)
-            return await self._sent(destination, amount_sats, idempotency_key)
+            return await self._sent(invoice, idempotency_key)
 
         self.send_mock.side_effect = slow_send
         first, second = await asyncio.gather(self.pay("site:1", 600), self.pay("site:2", 600))
@@ -247,9 +380,9 @@ class LimitsTest(PayTestCase):
         self.assertEqual(self.send_mock.await_count, 1)
 
     async def test_request_that_waited_too_long_for_its_turn_is_not_sent(self):
-        async def slow_send(destination, amount_sats, idempotency_key):
+        async def slow_send(invoice, idempotency_key):
             await asyncio.sleep(0.1)
-            return await self._sent(destination, amount_sats, idempotency_key)
+            return await self._sent(invoice, idempotency_key)
 
         self.send_mock.side_effect = slow_send
         with patch.object(self.app_module, "MAX_LOCK_WAIT_SECONDS", 0.05):
@@ -303,7 +436,7 @@ class DailySentTest(unittest.IsolatedAsyncioTestCase):
                 await self.spark_client.daily_sent_sats()
 
 
-class SendLightningTest(unittest.IsolatedAsyncioTestCase):
+class SendInvoiceTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
         _, _, self.spark_client = _load_modules(self._dir.name)
@@ -312,35 +445,34 @@ class SendLightningTest(unittest.IsolatedAsyncioTestCase):
         self._dir.cleanup()
 
     def _sdk(self, pay_error=None, payment_status=spark.PaymentStatus.PENDING):
-        self.pay_requests = []
+        self.requests = []
 
-        class Parsed(list):
-            def is_lightning_address(self):
-                return True
+        async def prepare_send_payment(*, request):
+            self.requests.append(("prepare", request))
+            return "prepared"
 
-        async def parse(*, input):
-            return Parsed([SimpleNamespace(pay_request=object())])
-
-        async def prepare_lnurl_pay(*, request):
-            return object()
-
-        async def lnurl_pay(*, request):
-            self.pay_requests.append(request)
+        async def send_payment(*, request):
+            self.requests.append(("send", request))
             if pay_error:
                 raise pay_error
             return SimpleNamespace(payment=SimpleNamespace(id="tx-1", status=payment_status))
 
-        return SimpleNamespace(parse=parse, prepare_lnurl_pay=prepare_lnurl_pay, lnurl_pay=lnurl_pay)
+        return SimpleNamespace(prepare_send_payment=prepare_send_payment, send_payment=send_payment)
 
     async def _send(self, sdk, key="00000000-0000-0000-0000-000000000001"):
         with patch.object(self.spark_client, "connect", AsyncMock(return_value=sdk)), \
-                patch.object(spark, "PrepareLnurlPayRequest", lambda **kw: kw), \
-                patch.object(spark, "LnurlPayRequest", lambda **kw: kw):
-            return await self.spark_client.send_lightning(DEST, 100, key)
+                patch.object(spark, "PrepareSendPaymentRequest", lambda **kw: kw), \
+                patch.object(spark, "SendPaymentRequest", lambda **kw: kw):
+            return await self.spark_client.send_invoice("lnbc-invoice", key)
 
-    async def test_the_idempotency_key_reaches_the_sdk(self):
+    async def test_pays_the_invoice_with_the_idempotency_key(self):
         await self._send(self._sdk(), key="00000000-0000-0000-0000-00000000abcd")
-        self.assertEqual(self.pay_requests[0]["idempotency_key"], "00000000-0000-0000-0000-00000000abcd")
+
+        prepare = self.requests[0][1]
+        self.assertEqual(prepare["payment_request"].input, "lnbc-invoice")
+        send = self.requests[1][1]
+        self.assertEqual(send["idempotency_key"], "00000000-0000-0000-0000-00000000abcd")
+        self.assertEqual(send["prepare_response"], "prepared")
 
     async def test_sdk_error_returns_no_payment(self):
         result = await self._send(self._sdk(pay_error=RuntimeError("timeout")))

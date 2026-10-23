@@ -38,6 +38,7 @@ Outbound:
 
 - `app.py` — FastAPI surface. Auth via `Depends`. Amount, daily-cap and idempotency checks on `/pay`.
 - `spark_client.py` — SDK singleton and Lightning send path.
+- `receipts.py` — invoices from the Lightning address and LUD-21 verification with the receiver.
 - `rate.py` — BTC/USD rate cache.
 - `webhook.py` — outbox retrier and event→status helpers.
 - `db.py` — SQLite webhook outbox and payout ledger (payment state itself lives in the SDK).
@@ -66,6 +67,8 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests   # tests
 | `HOST`, `PORT`        | uvicorn bind. Defaults `0.0.0.0:3000`.                                         |
 | `DAILY_SEND_CAP_SATS` | Optional rolling 24h spending ceiling, also the largest single payout. Fails closed. |
 | `WEBHOOK_GIVE_UP_DAYS` | Days Moodle may answer "tx_id not found" for a webhook, without interruption, before the service gives up on it (default 7, 0 = forever). |
+| `VERIFY_INTERVAL_SECONDS` | How often payouts the SDK reported failed are checked with the receiver (default 300). |
+| `VERIFY_FAIL_AFTER_HOURS` | Hours the receiver must keep saying "not paid" before a payout is reported failed (default 24). |
 | `MOCK_BTC_USD_RATE`   | Optional fallback rate; only used if Spark `list_fiat_rates` fails.            |
 
 `.env` and `data/` are gitignored. `.env.example` is the tracked template.
@@ -98,6 +101,30 @@ plugin's id for the payout, unique per Moodle site.
   pass the cap check. A request that waited more than 30 s for its turn gets
   HTTP 503 rather than being sent after the plugin gave up on it. Run a single
   uvicorn worker.
+
+## Receiver verification
+
+The Breez SDK can report a Lightning send failed although the receiver was
+paid, and it never updates a stored Failed status. So the service does not
+use `lnurl_pay`: it gets the invoice from the Lightning address callback
+itself (LUD-06, amount and description hash checked), stores it with the
+payout together with the LUD-21 `verify` URL, and pays exactly that invoice
+with the payout's idempotency key. Every retry pays the same invoice; an
+invoice is only replaced once it has expired with no payment under the key.
+
+When the SDK reports the payment failed and the payout has a verify URL, the
+payout becomes `verifying`: `/pay` answers `processing` and no failed webhook
+is sent. Every `VERIFY_INTERVAL_SECONDS` (default 300) the service asks the
+verify URL:
+
+- paid, with a preimage that hashes to the invoice's payment hash: the payout
+  is `sent` and Moodle gets a `settled` webhook carrying the preimage;
+- still not paid after `VERIFY_FAIL_AFTER_HOURS` (default 24): `failed` and a
+  `failed` webhook;
+- no trustworthy answer (unreachable, error, settled without valid preimage):
+  nothing changes, the payout keeps waiting.
+
+Payouts whose address has no verify URL keep the SDK's verdict.
 
 ## Webhook contract
 

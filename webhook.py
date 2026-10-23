@@ -24,6 +24,7 @@ import urllib.request
 import breez_sdk_spark as spark
 
 import db
+import receipts
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -166,7 +167,14 @@ class Retrier:
             logger.info("webhook retrier stopped")
 
     def _run(self) -> None:
+        next_verify = 0.0
         while not self._stop.is_set():
+            if time.monotonic() >= next_verify:
+                next_verify = time.monotonic() + settings.verify_interval_seconds
+                try:
+                    receipts.check_verifying()
+                except Exception:
+                    logger.exception("verify check error")
             try:
                 rows = db.claim_due(limit=20)
                 for row in rows:
