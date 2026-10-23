@@ -7,6 +7,7 @@ Contract:
   GET  /status/{tx_id}       → live SDK state (debug)
   GET  /balance              → wallet balance (debug)
   GET  /rate                 → BTC/USD rate in cents
+  GET  /webhooks/undelivered → webhook deliveries still retrying or given up
   Webhook (outbound)         → Moodle receives terminal events, retried until 2xx
 """
 
@@ -214,6 +215,13 @@ async def get_status(tx_id: str) -> StatusResponse:
     if info is None:
         raise HTTPException(status_code=404, detail="tx_id not found")
     return StatusResponse(**info)
+
+
+@app.get("/webhooks/undelivered", dependencies=[auth_required])
+def webhooks_undelivered():
+    """Webhook deliveries Moodle hasn't accepted: still retrying, or given up
+    after WEBHOOK_GIVE_UP_DAYS and waiting for manual review."""
+    return db.undelivered()
 
 
 @app.get("/health")

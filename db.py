@@ -33,6 +33,10 @@ def _ensure_db() -> None:
                 created_at       TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # Added after the first release: rows the retrier gave up on.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(webhook_outbox)")}
+        if "abandoned_at" not in columns:
+            conn.execute("ALTER TABLE webhook_outbox ADD COLUMN abandoned_at TEXT")
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_outbox_pending
             ON webhook_outbox(next_attempt_at)
@@ -76,14 +80,16 @@ def enqueue(tx_id: str, status: str, payload: dict) -> bool:
 
 
 def claim_due(limit: int = 20) -> list[dict]:
-    """Return up-to-limit outbox rows due for delivery (delivered_at IS NULL,
-    next_attempt_at <= now)."""
+    """Return up-to-limit outbox rows due for delivery (not delivered, not
+    abandoned, next_attempt_at <= now), each with its age in days."""
     with _conn() as conn:
         rows = conn.execute(
             """
-            SELECT tx_id, status, payload_json, attempts
+            SELECT tx_id, status, payload_json, attempts,
+                   julianday('now') - julianday(created_at) AS age_days
             FROM webhook_outbox
-            WHERE delivered_at IS NULL AND next_attempt_at <= datetime('now')
+            WHERE delivered_at IS NULL AND abandoned_at IS NULL
+              AND next_attempt_at <= datetime('now')
             ORDER BY next_attempt_at
             LIMIT ?
             """,
@@ -98,6 +104,34 @@ def mark_delivered(tx_id: str) -> None:
             "UPDATE webhook_outbox SET delivered_at = datetime('now') WHERE tx_id = ?",
             (tx_id,),
         )
+
+
+def mark_abandoned(tx_id: str, error: str) -> None:
+    """Stop retrying a delivery. It stays in the outbox for manual review."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE webhook_outbox
+            SET attempts = attempts + 1, abandoned_at = datetime('now'), last_error = ?
+            WHERE tx_id = ?
+            """,
+            (error[:500], tx_id),
+        )
+
+
+def undelivered(limit: int = 50) -> dict:
+    """Deliveries still being retried and deliveries given up on, oldest first."""
+    query = """
+        SELECT tx_id, status, attempts, created_at, abandoned_at, last_error
+        FROM webhook_outbox
+        WHERE delivered_at IS NULL AND abandoned_at IS {} NULL
+        ORDER BY created_at
+        LIMIT ?
+    """
+    with _conn() as conn:
+        retrying = conn.execute(query.format(""), (limit,)).fetchall()
+        abandoned = conn.execute(query.format("NOT"), (limit,)).fetchall()
+    return {"retrying": [dict(r) for r in retrying], "abandoned": [dict(r) for r in abandoned]}
 
 
 def mark_failed(tx_id: str, backoff_seconds: int, error: str) -> None:

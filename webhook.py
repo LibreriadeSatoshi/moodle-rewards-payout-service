@@ -3,7 +3,9 @@
 The retrier runs on a background thread. On each tick it drains any due rows
 from db.webhook_outbox, POSTs them to MOODLE_WEBHOOK_URL with a signature
 header, and either marks them delivered or pushes next_attempt_at forward
-using capped exponential backoff. Retries forever until 2xx.
+using capped exponential backoff. Retries until 2xx, or gives up after
+WEBHOOK_GIVE_UP_DAYS and logs an error; given-up rows stay in the outbox and
+are listed by GET /webhooks/undelivered.
 """
 
 from __future__ import annotations
@@ -92,10 +94,7 @@ def _deliver_one(row: dict) -> None:
     try:
         status, resp_text = _post(settings.moodle_webhook_url, body)
     except Exception as exc:
-        err = str(exc)
-        delay = _backoff(row["attempts"])
-        logger.warning("webhook %s failed (network): %s — retry in %ds", tx_id, err, delay)
-        db.mark_failed(tx_id, delay, err)
+        _record_failure(row, f"network: {exc}")
         return
 
     if 200 <= status < 300:
@@ -103,9 +102,22 @@ def _deliver_one(row: dict) -> None:
         db.mark_delivered(tx_id)
         return
 
+    _record_failure(row, f"HTTP {status}: {resp_text[:200]}")
+
+
+def _record_failure(row: dict, err: str) -> None:
+    """Schedule a retry, or give up once the event is older than the limit."""
+    tx_id = row["tx_id"]
+    give_up_days = settings.webhook_give_up_days
+    if give_up_days > 0 and row["age_days"] >= give_up_days:
+        logger.error(
+            "webhook %s given up after %d attempts over %.1f days, needs manual review: %s",
+            tx_id, row["attempts"] + 1, row["age_days"], err,
+        )
+        db.mark_abandoned(tx_id, err)
+        return
     delay = _backoff(row["attempts"])
-    err = f"HTTP {status}: {resp_text[:200]}"
-    logger.warning("webhook %s rejected: %s — retry in %ds", tx_id, err, delay)
+    logger.warning("webhook %s failed: %s, retry in %ds", tx_id, err, delay)
     db.mark_failed(tx_id, delay, err)
 
 

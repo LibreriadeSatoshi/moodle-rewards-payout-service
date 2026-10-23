@@ -10,7 +10,7 @@ The wallet is a Breez SDK Spark wallet. Only Lightning addresses
 
 ```
 plugin  ──POST /pay──▶  service     auth: X-Internal-Token
-plugin  ◀POST /webhook  service     auth: HMAC-SHA256, retried forever
+plugin  ◀POST /webhook  service     auth: HMAC-SHA256, retried up to WEBHOOK_GIVE_UP_DAYS
 ```
 
 The service verifies the destination is a Lightning address via the SDK,
@@ -26,6 +26,7 @@ bolt11, bolt12, Spark address) is rejected at `/pay` with HTTP 400.
 | POST   | /pay     | `X-Internal-Token`  | Submit a Lightning-address payment     |
 | GET    | /status  | `X-Internal-Token`  | Live SDK state for a tx_id (debug)     |
 | GET    | /balance | `X-Internal-Token`  | Wallet balance + pending sats (debug)  |
+| GET    | /webhooks/undelivered | `X-Internal-Token` | Webhooks still retrying or given up |
 
 Outbound:
 
@@ -64,6 +65,7 @@ PYTHONPATH=. .venv/bin/python -m unittest discover -s tests   # tests
 | `MOODLE_WEBHOOK_URL`  | Where to POST terminal events. Plugin endpoint: `…/local/btcrewards/webhook.php`. |
 | `HOST`, `PORT`        | uvicorn bind. Defaults `0.0.0.0:3000`.                                         |
 | `DAILY_SEND_CAP_SATS` | Optional rolling 24h spending ceiling, also the largest single payout. Fails closed. |
+| `WEBHOOK_GIVE_UP_DAYS` | Days to retry a webhook Moodle rejects before giving up (default 7, 0 = forever). |
 | `MOCK_BTC_USD_RATE`   | Optional fallback rate; only used if Spark `list_fiat_rates` fails.            |
 
 `.env` and `data/` are gitignored. `.env.example` is the tracked template.
@@ -106,7 +108,14 @@ seconds). The plugin verifies:
 - `|now - timestamp|` is within 5 minutes (replay window).
 - `tx_id` is known and `status` is one of `settled` or `failed`.
 
-The service retries forever on non-2xx; the plugin must be idempotent by `tx_id`.
+The service retries non-2xx answers with exponential backoff (capped at one
+hour) and the plugin must be idempotent by `tx_id`. Early 404s are normal: the
+event can arrive before Moodle has stored the payment's `tx_id`. After
+`WEBHOOK_GIVE_UP_DAYS` (default 7) the service gives up on the event, logs an
+error ("given up … needs manual review") and keeps the row in the outbox with
+`abandoned_at` set. `GET /webhooks/undelivered` lists rows still retrying and
+rows given up. To retry one after fixing the cause, clear its `abandoned_at`
+in `data/outbox.db`.
 
 ## Constraints
 
