@@ -24,6 +24,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 import db
+import receipts
 import spark_client
 import rate as rate_module
 from config import settings
@@ -37,7 +38,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(application: FastAPI):
     await spark_client.connect()
     retrier.start()
+    receipts.checker.start()
     yield
+    receipts.checker.stop()
     retrier.stop()
     await spark_client.disconnect()
 
@@ -112,11 +115,16 @@ MAX_LOCK_WAIT_SECONDS = 30
 async def pay(body: PayRequest) -> PayResponse:
     """Send a payout, at most once per payout_id. Terminal state arrives later via webhook.
 
-    Every send uses an SDK idempotency key derived from payout_id, so a retry
-    after a timeout, crash or SDK error returns the original payment if one was
-    made and pays only if none was. A send that raised answers 503: the plugin
-    keeps the payout pending and retries the same payout_id, and never gives up
-    on a payment that may have gone out.
+    The service gets the invoice from the Lightning address itself and keeps it
+    with the payout, so every retry pays the same invoice with the same SDK
+    idempotency key: a retry after a timeout, crash or SDK error returns the
+    original payment if one was made and pays only if none was. A send that
+    raised answers 503: the plugin keeps the payout pending and retries.
+
+    When the SDK reports the payment failed and the invoice has a LUD-21 verify
+    URL, the payout is 'verifying': answered "processing" until the receiver
+    confirms it (webhook settled) or still says "not paid" after
+    VERIFY_FAIL_AFTER_HOURS (webhook failed). See receipts.py.
     """
     cap = settings.daily_send_cap_sats
     if body.amount_sats <= 0:
@@ -130,40 +138,99 @@ async def pay(body: PayRequest) -> PayResponse:
             raise HTTPException(status_code=503, detail="service busy, retry later")
 
         key = spark_client.payment_key(body.payout_id)
-        existing = db.get_payout(body.payout_id)
-        if existing is not None:
-            if existing["amount_sats"] != body.amount_sats or existing["destination"] != body.destination:
+        payout = db.get_payout(body.payout_id)
+        if payout is not None:
+            if payout["amount_sats"] != body.amount_sats or payout["destination"] != body.destination:
                 raise HTTPException(status_code=409, detail="payout_id was already used for a different payment")
-            if existing["state"] == "sent":
-                return await _sent_response(existing["tx_id"])
-            # An earlier attempt got no payment back. If it went out anyway,
-            # answer with it; otherwise this is a fresh send and faces the cap.
+            if payout["state"] == "sent":
+                return await _sent_response(payout)
+            if payout["state"] == "verifying":
+                return _verifying_response(payout)
+            if payout["state"] == "failed":
+                return _payment_response(payout["tx_id"] or "", "failed")
+            # 'pending': an earlier attempt got no payment back. If it went out
+            # anyway, answer with it; otherwise this is a fresh send.
             try:
                 found = await spark_client.find_payment(key)
             except spark_client.PaymentLookupUnavailable as exc:
                 raise HTTPException(status_code=503, detail=f"payment lookup unavailable: {exc}")
             if found is not None:
-                db.finish_payout(body.payout_id, "sent", tx_id=found["tx_id"])
-                db.revive(found["tx_id"])
-                return _payment_response(found["tx_id"], found["status"])
+                return _record_payment(payout, found)
 
         await _check_cap(body.amount_sats)
-        if existing is None:
-            try:
-                await spark_client.ensure_ln_address(body.destination)
-            except spark_client.UnsupportedDestination as exc:
-                raise HTTPException(status_code=400, detail=str(exc))
-            db.start_payout(body.payout_id, body.amount_sats, body.destination)
+        if payout is None:
+            invoice = await _new_invoice(body.payout_id, body.destination, body.amount_sats)
+            db.start_payout(body.payout_id, body.amount_sats, body.destination, invoice, tx_id=key)
+        else:
+            # Payouts recorded before tx_id was set at creation get it now, so
+            # events for this send are matched to the payout.
+            db.set_tx_id_if_missing(body.payout_id, key)
+            if not payout["invoice"] or payout["expires_at"] <= time.time():
+                # No invoice yet (payout from before invoices were stored), or it
+                # expired: no payment exists under this key, so a new invoice is
+                # safe. The old one stays in payout_invoices and is still verified.
+                db.set_invoice(body.payout_id, await _new_invoice(body.payout_id, body.destination, body.amount_sats))
+        payout = db.get_payout(body.payout_id)
 
-        result = await spark_client.send_lightning(body.destination, body.amount_sats, key)
+        result = await spark_client.send_invoice(payout["invoice"], key)
         if not result["tx_id"]:
             db.finish_payout(body.payout_id, "pending", error=result["error"])
             raise HTTPException(status_code=503, detail=f"send failed, retry later: {result['error']}")
-        db.finish_payout(body.payout_id, "sent", tx_id=result["tx_id"])
-        # With idempotency keys the SDK may return an earlier payment whose webhook was given up.
-        db.revive(result["tx_id"])
+        return _record_payment(payout, result)
 
-    return _payment_response(result["tx_id"], result["status"])
+
+async def _new_invoice(payout_id: str, destination: str, amount_sats: int) -> dict:
+    """Get and check an invoice for amount_sats from a Lightning address."""
+    try:
+        details = await spark_client.pay_request(destination)
+    except spark_client.UnsupportedDestination as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not details.min_sendable <= amount_sats * 1000 <= details.max_sendable:
+        raise HTTPException(status_code=400, detail="amount outside the Lightning address's limits")
+    try:
+        answer = await asyncio.to_thread(receipts.request_invoice, details.callback, amount_sats)
+    except receipts.InvoiceUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    try:
+        invoice = await spark_client.invoice_details(answer["invoice"])
+        receipts.check_invoice(invoice, amount_sats, details.metadata_str)
+    except receipts.InvalidInvoice as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    owner = db.invoice_owner(invoice.payment_hash)
+    if owner is not None and owner != payout_id:
+        # Paying it would fail, and its verify URL would vouch for the other
+        # payout's payment: this payout would look paid without being paid.
+        raise HTTPException(status_code=502, detail="the Lightning address returned an invoice already used")
+    return {
+        "invoice": answer["invoice"],
+        "payment_hash": invoice.payment_hash,
+        "verify_url": answer["verify_url"],
+        "expires_at": invoice.timestamp + invoice.expiry,
+    }
+
+
+def _record_payment(payout: dict, payment: dict) -> PayResponse:
+    """Record the SDK's payment for a payout and answer with the payout's state."""
+    payout_id, tx_id = payout["payout_id"], payment["tx_id"]
+    db.record_sent(payout_id, tx_id)
+    # With idempotency keys the SDK may return an earlier payment whose webhook was given up.
+    db.revive(tx_id)
+    if payment["status"] == "failed":
+        if payout["verify_url"]:
+            db.mark_verifying(payout_id)
+        else:
+            db.finish_payout(payout_id, "failed", tx_id=tx_id)
+    payout = db.get_payout(payout_id)
+    if payout["state"] == "verifying":
+        return _verifying_response(payout)
+    if payout["preimage"]:
+        return _payment_response(tx_id, "settled")  # The receiver confirmed it.
+    return _payment_response(tx_id, payment["status"])
+
+
+def _verifying_response(payout: dict) -> PayResponse:
+    # The plugin keeps the payout ACCEPTED; the verify checker sends the outcome by webhook.
+    return PayResponse(tx_id=payout["tx_id"] or "", status="processing", dest_type="ln_address")
 
 
 async def _check_cap(amount_sats: int) -> None:
@@ -188,17 +255,23 @@ def _payment_response(tx_id: str, status: str) -> PayResponse:
     return PayResponse(tx_id=tx_id, status=status, dest_type="ln_address", retryable=status != "failed")
 
 
-async def _sent_response(tx_id: str) -> PayResponse:
+async def _sent_response(payout: dict) -> PayResponse:
     """Answer a payout that already has a payment with that payment's live state.
 
     Moodle is asking about this payout again, so it will now store the tx_id:
     retry its webhook from scratch in case the retrier had given up on it.
     """
+    tx_id = payout["tx_id"]
     db.revive(tx_id)
+    if payout["preimage"]:
+        return _payment_response(tx_id, "settled")  # The receiver confirmed it.
     try:
         found = await spark_client.find_payment(tx_id)
     except spark_client.PaymentLookupUnavailable:
         found = None
+    if found is not None and found["status"] == "failed" and payout["verify_url"]:
+        db.mark_verifying(payout["payout_id"])
+        return _verifying_response(payout)
     return _payment_response(tx_id, found["status"] if found else "processing")
 
 
@@ -228,8 +301,13 @@ async def get_status(tx_id: str) -> StatusResponse:
 @app.get("/webhooks/undelivered", dependencies=[auth_required])
 def webhooks_undelivered():
     """Webhook deliveries Moodle hasn't accepted: still retrying, or given up
-    after WEBHOOK_GIVE_UP_DAYS and waiting for manual review."""
-    return db.undelivered()
+    after WEBHOOK_GIVE_UP_DAYS and waiting for manual review. Also the payouts
+    the SDK reported failed that are still waiting for the receiver's word."""
+    waiting = [
+        {key: p[key] for key in ("payout_id", "tx_id", "state", "amount_sats", "unconfirmed_since", "hours_unconfirmed")}
+        for p in db.verifying()
+    ]
+    return {**db.undelivered(), "verifying": waiting}
 
 
 @app.get("/health")

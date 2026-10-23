@@ -21,6 +21,9 @@ DB_PATH = Path("data/outbox.db")
 def _ensure_db() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _conn() as conn:
+        # Readers don't block the writer: the event listener, /pay and the two
+        # background threads each write with their own connection.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS webhook_outbox (
                 tx_id            TEXT PRIMARY KEY,
@@ -45,7 +48,10 @@ def _ensure_db() -> None:
             WHERE delivered_at IS NULL
         """)
         # state: 'pending' until the SDK returned a payment for this payout,
-        # then 'sent' with its tx_id.
+        # then 'sent' with its tx_id. When the SDK reports that payment failed
+        # and the invoice has a LUD-21 verify URL: 'verifying' (since
+        # unconfirmed_since) until the receiver confirms it ('sent', with the
+        # preimage) or still says "not paid" long enough ('failed').
         conn.execute("""
             CREATE TABLE IF NOT EXISTS payouts (
                 payout_id    TEXT PRIMARY KEY,
@@ -58,6 +64,26 @@ def _ensure_db() -> None:
                 updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # Every invoice a payout has had (it gets a new one only after the
+        # previous one expired), so the receiver can be asked about each.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS payout_invoices (
+                payment_hash TEXT PRIMARY KEY,
+                payout_id    TEXT NOT NULL,
+                invoice      TEXT NOT NULL,
+                verify_url   TEXT,
+                expires_at   INTEGER NOT NULL,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        # Added after the first release: the invoice each payout pays, and
+        # its receiver-side verification.
+        payout_columns = {row[1] for row in conn.execute("PRAGMA table_info(payouts)")}
+        for column in ("invoice", "payment_hash", "verify_url", "expires_at", "unconfirmed_since", "preimage",
+                       "paid_at", "last_checked_at"):
+            if column not in payout_columns:
+                kind = "INTEGER" if column == "expires_at" else "TEXT"
+                conn.execute(f"ALTER TABLE payouts ADD COLUMN {column} {kind}")
 
 
 @contextmanager
@@ -71,14 +97,35 @@ def _conn():
         conn.close()
 
 
-def enqueue(tx_id: str, status: str, payload: dict) -> bool:
-    """Insert a delivery. Idempotent by tx_id — returns True if inserted."""
+def enqueue(tx_id: str, status: str, payload: dict) -> str:
+    """Queue a delivery, idempotent by tx_id. Returns "inserted", "upgraded" or "".
+
+    A "settled" event replaces an earlier "failed" one for the same payment,
+    delivered or not, and is delivered from scratch: Spark can report a
+    Lightning send failed and later completed (the preimage arrives late), and
+    then the money did leave. Nothing ever replaces a "settled" event.
+    """
+    body = json.dumps(payload, sort_keys=True)
     with _conn() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO webhook_outbox (tx_id, status, payload_json) VALUES (?, ?, ?)",
-            (tx_id, status, json.dumps(payload, sort_keys=True)),
+            (tx_id, status, body),
         )
-        return cur.rowcount > 0
+        if cur.rowcount > 0:
+            return "inserted"
+        if status != "settled":
+            return ""
+        cur = conn.execute(
+            """
+            UPDATE webhook_outbox
+            SET status = 'settled', payload_json = ?, attempts = 0,
+                next_attempt_at = datetime('now'), delivered_at = NULL, last_error = NULL,
+                rejected_since = NULL, abandoned_at = NULL
+            WHERE tx_id = ? AND status = 'failed'
+            """,
+            (body, tx_id),
+        )
+        return "upgraded" if cur.rowcount > 0 else ""
 
 
 def claim_due(limit: int = 20) -> list[dict]:
@@ -101,15 +148,17 @@ def claim_due(limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def mark_delivered(tx_id: str) -> None:
+def mark_delivered(tx_id: str, status: str) -> None:
+    """Mark the `status` event for tx_id delivered. A no-op if the row was
+    replaced by another status while it was being delivered."""
     with _conn() as conn:
         conn.execute(
-            "UPDATE webhook_outbox SET delivered_at = datetime('now') WHERE tx_id = ?",
-            (tx_id,),
+            "UPDATE webhook_outbox SET delivered_at = datetime('now') WHERE tx_id = ? AND status = ?",
+            (tx_id, status),
         )
 
 
-def mark_abandoned(tx_id: str, error: str, give_up_days: float) -> bool:
+def mark_abandoned(tx_id: str, status: str, error: str, give_up_days: float) -> bool:
     """Stop retrying a delivery Moodle has answered "tx_id not found" for at
     least give_up_days. The row stays in the outbox for manual review. Returns
     False, changing nothing, if the row no longer qualifies (delivered, or
@@ -119,11 +168,11 @@ def mark_abandoned(tx_id: str, error: str, give_up_days: float) -> bool:
             """
             UPDATE webhook_outbox
             SET attempts = attempts + 1, abandoned_at = datetime('now'), last_error = ?
-            WHERE tx_id = ? AND delivered_at IS NULL AND abandoned_at IS NULL
+            WHERE tx_id = ? AND status = ? AND delivered_at IS NULL AND abandoned_at IS NULL
               AND rejected_since IS NOT NULL
               AND julianday('now') - julianday(rejected_since) >= ?
             """,
-            (error[:500], tx_id, give_up_days),
+            (error[:500], tx_id, status, give_up_days),
         )
         return cur.rowcount > 0
 
@@ -143,7 +192,7 @@ def undelivered(limit: int = 50) -> dict:
     return {"retrying": [dict(r) for r in retrying], "abandoned": [dict(r) for r in abandoned]}
 
 
-def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
+def mark_failed(tx_id: str, status: str, backoff_seconds: int, error: str, not_found: bool = False) -> None:
     """Increment attempts and push next_attempt_at into the future. not_found
     starts the give-up clock (rejected_since) if it isn't running yet; any other
     failure stops it, so only an unbroken run of "tx_id not found" counts."""
@@ -156,9 +205,9 @@ def mark_failed(tx_id: str, backoff_seconds: int, error: str, not_found: bool = 
                 last_error = ?,
                 rejected_since = CASE WHEN ? THEN coalesce(rejected_since, datetime('now'))
                                       ELSE NULL END
-            WHERE tx_id = ?
+            WHERE tx_id = ? AND status = ?
             """,
-            (f"+{backoff_seconds}", error[:500], not_found, tx_id),
+            (f"+{backoff_seconds}", error[:500], not_found, tx_id, status),
         )
 
 
@@ -182,13 +231,40 @@ def get_payout(payout_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def start_payout(payout_id: str, amount_sats: int, destination: str) -> None:
+def start_payout(
+    payout_id: str, amount_sats: int, destination: str, invoice: dict | None = None, tx_id: str = ""
+) -> None:
     """Record a new payout before its first send. Raises sqlite3.IntegrityError
-    if the payout_id is already recorded."""
+    if the payout_id is already recorded. invoice: see set_invoice. tx_id: the
+    payment id the send will get (the SDK uses the idempotency key), so events
+    for it are matched to this payout even before the send returns."""
     with _conn() as conn:
         conn.execute(
-            "INSERT INTO payouts (payout_id, amount_sats, destination, state) VALUES (?, ?, ?, 'pending')",
-            (payout_id, amount_sats, destination),
+            "INSERT INTO payouts (payout_id, amount_sats, destination, state, tx_id) VALUES (?, ?, ?, 'pending', ?)",
+            (payout_id, amount_sats, destination, tx_id or None),
+        )
+    if invoice is not None:
+        set_invoice(payout_id, invoice)
+
+
+def set_invoice(payout_id: str, invoice: dict) -> None:
+    """Store the invoice a payout pays: {invoice, payment_hash, verify_url, expires_at}.
+    Earlier invoices stay in payout_invoices."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO payout_invoices (payment_hash, payout_id, invoice, verify_url, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (invoice["payment_hash"], payout_id, invoice["invoice"], invoice["verify_url"], invoice["expires_at"]),
+        )
+        conn.execute(
+            """
+            UPDATE payouts
+            SET invoice = ?, payment_hash = ?, verify_url = ?, expires_at = ?, updated_at = datetime('now')
+            WHERE payout_id = ?
+            """,
+            (invoice["invoice"], invoice["payment_hash"], invoice["verify_url"], invoice["expires_at"], payout_id),
         )
 
 
@@ -197,11 +273,129 @@ def finish_payout(payout_id: str, state: str, tx_id: str = "", error: str = "") 
         conn.execute(
             """
             UPDATE payouts
-            SET state = ?, tx_id = ?, error = ?, updated_at = datetime('now')
+            SET state = ?, tx_id = coalesce(?, tx_id), error = ?, updated_at = datetime('now')
             WHERE payout_id = ?
             """,
             (state, tx_id or None, error[:500] or None, payout_id),
         )
+
+
+def record_sent(payout_id: str, tx_id: str) -> None:
+    """A send returned a payment: 'pending' becomes 'sent'. Any other state was
+    already decided (by the event listener or the verify checker) and stays."""
+    with _conn() as conn:
+        conn.execute(
+            """
+            UPDATE payouts SET state = 'sent', tx_id = ?, error = NULL, updated_at = datetime('now')
+            WHERE payout_id = ? AND state = 'pending'
+            """,
+            (tx_id, payout_id),
+        )
+
+
+def set_tx_id_if_missing(payout_id: str, tx_id: str) -> None:
+    """Payouts recorded before tx_id was set at creation get it before their next send."""
+    with _conn() as conn:
+        conn.execute("UPDATE payouts SET tx_id = ? WHERE payout_id = ? AND tx_id IS NULL", (tx_id, payout_id))
+
+
+def invoices(payout_id: str) -> list[dict]:
+    """Every invoice a payout has had, oldest first."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM payout_invoices WHERE payout_id = ? ORDER BY created_at, rowid", (payout_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def invoice_owner(payment_hash: str) -> str | None:
+    """The payout an invoice was already given to, if any."""
+    with _conn() as conn:
+        row = conn.execute("SELECT payout_id FROM payout_invoices WHERE payment_hash = ?", (payment_hash,)).fetchone()
+    return row[0] if row else None
+
+
+def mark_checked(payout_id: str) -> None:
+    """The receiver was asked about this payout: it goes to the back of the queue."""
+    with _conn() as conn:
+        conn.execute("UPDATE payouts SET last_checked_at = datetime('now') WHERE payout_id = ?", (payout_id,))
+
+
+def get_payout_by_tx(tx_id: str) -> dict | None:
+    with _conn() as conn:
+        row = conn.execute("SELECT * FROM payouts WHERE tx_id = ?", (tx_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def mark_verifying(payout_id: str) -> bool:
+    """The SDK says this payout's payment failed: wait for the receiver's word.
+    Only from 'sent' or 'pending', and never once the receiver confirmed it
+    (preimage stored); returns True if the row changed."""
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE payouts
+            SET state = 'verifying', unconfirmed_since = coalesce(unconfirmed_since, datetime('now')),
+                updated_at = datetime('now')
+            WHERE payout_id = ? AND state IN ('sent', 'pending') AND preimage IS NULL AND paid_at IS NULL
+            """,
+            (payout_id,),
+        )
+        return cur.rowcount > 0
+
+
+def resolve_verifying(payout_id: str, state: str, preimage: str = "") -> bool:
+    """Close a 'verifying' payout as 'sent' (paid, with preimage) or 'failed'.
+    Returns False if it was not 'verifying' any more."""
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE payouts
+            SET state = ?, preimage = coalesce(?, preimage), updated_at = datetime('now')
+            WHERE payout_id = ? AND state = 'verifying'
+            """,
+            (state, preimage or None, payout_id),
+        )
+        return cur.rowcount > 0
+
+
+def mark_paid(payout_id: str, preimage: str = "") -> bool:
+    """The payment turned out paid after all ('verifying' or 'failed' → 'sent').
+    Returns False if the payout was in neither state."""
+    with _conn() as conn:
+        cur = conn.execute(
+            """
+            UPDATE payouts
+            SET state = 'sent', preimage = coalesce(?, preimage), paid_at = datetime('now'),
+                updated_at = datetime('now')
+            WHERE payout_id = ? AND state IN ('verifying', 'failed')
+            """,
+            (preimage or None, payout_id),
+        )
+        return cur.rowcount > 0
+
+
+def verifying(limit: int = 100) -> list[dict]:
+    """Payouts to ask the receiver about, oldest first, with the hours waited:
+    'verifying' ones, and 'failed' ones until a day after their last invoice
+    expires, because a payment in flight can still settle until then."""
+    with _conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, (julianday('now') - julianday(p.unconfirmed_since)) * 24 AS hours_unconfirmed
+            FROM payouts p
+            WHERE p.verify_url IS NOT NULL AND (
+                p.state = 'verifying'
+                OR (p.state = 'failed' AND p.unconfirmed_since IS NOT NULL
+                    AND (SELECT max(expires_at) FROM payout_invoices i WHERE i.payout_id = p.payout_id)
+                        + 86400 > CAST(strftime('%s', 'now') AS INTEGER))
+            )
+            ORDER BY p.last_checked_at IS NOT NULL, p.last_checked_at, p.unconfirmed_since
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 _ensure_db()

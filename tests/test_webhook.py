@@ -28,7 +28,7 @@ def _load_modules(directory: str):
     with patch.dict(os.environ, ENV):
         try:
             os.chdir(directory)
-            for name in ("config", "db", "spark_client", "webhook", "rate", "app"):
+            for name in ("config", "db", "receipts", "spark_client", "webhook", "rate", "app"):
                 sys.modules.pop(name, None)
             db = importlib.import_module("db")
             db.DB_PATH = Path(directory) / "data" / "outbox.db"
@@ -193,10 +193,61 @@ class GiveUpTest(OutboxTestCase):
 
     def test_revive_leaves_delivered_events_alone(self):
         self.enqueue()
-        self.db.mark_delivered("tx-1")
+        self.db.mark_delivered("tx-1", "settled")
         self.db.revive("tx-1")
 
         self.assertEqual(self.db.claim_due(), [])
+
+
+class FailedThenSettledTest(OutboxTestCase):
+    def failed(self, tx_id="tx-1"):
+        return self.db.enqueue(tx_id, "failed", {"tx_id": tx_id, "status": "failed"})
+
+    def settled(self, tx_id="tx-1"):
+        return self.db.enqueue(tx_id, "settled", {"tx_id": tx_id, "status": "settled"})
+
+    def test_settled_after_a_delivered_failed_is_delivered_again(self):
+        self.failed()
+        self.deliver_due(200)
+        self.assertIsNotNone(self.row()["delivered_at"])
+
+        self.assertEqual(self.settled(), "upgraded")
+
+        row = self.row()
+        self.assertEqual(row["status"], "settled")
+        self.assertIsNone(row["delivered_at"])
+        self.assertEqual(json.loads(row["payload_json"])["status"], "settled")
+        self.assertEqual([r["tx_id"] for r in self.db.claim_due()], ["tx-1"])
+
+    def test_settled_replaces_an_undelivered_failed(self):
+        self.failed()
+        self.deliver_due(503)
+
+        self.assertEqual(self.settled(), "upgraded")
+        self.assertEqual(self.row()["attempts"], 0)
+        self.assertIsNone(self.row()["last_error"])
+
+    def test_nothing_replaces_settled(self):
+        self.assertEqual(self.settled(), "inserted")
+        self.assertEqual(self.failed(), "")
+        self.assertEqual(self.settled(), "")
+        self.assertEqual(self.row()["status"], "settled")
+
+    def test_repeated_failed_is_ignored(self):
+        self.assertEqual(self.failed(), "inserted")
+        self.assertEqual(self.failed(), "")
+
+    def test_failed_delivery_finishing_after_the_upgrade_does_not_mark_settled_delivered(self):
+        self.failed()
+        row = self.db.claim_due()[0]  # The retrier is POSTing "failed"...
+        self.settled()  # ...when the payment turns out settled.
+
+        with patch.object(self.webhook, "_post", return_value=(200, "{}")):
+            self.webhook._deliver_one(row)
+
+        self.assertEqual(self.row()["status"], "settled")
+        self.assertIsNone(self.row()["delivered_at"])
+        self.assertEqual([r["status"] for r in self.db.claim_due()], ["settled"])
 
 
 class MigrationTest(unittest.TestCase):
@@ -234,7 +285,7 @@ class UndeliveredEndpointTest(OutboxTestCase):
         self.enqueue("tx-done", age_days=1)
         with self.assertLogs("webhook", level="ERROR"):
             self.deliver_due()
-        self.db.mark_delivered("tx-done")
+        self.db.mark_delivered("tx-done", "settled")
 
         response = asyncio.run(self._get({"X-Internal-Token": "secret-token"}))
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import breez_sdk_spark as spark
 
 import db
+import receipts
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -48,10 +49,24 @@ class _Listener(spark.EventListener):
         tx_id = payment.id
         if not tx_id:
             return
+        if status == "failed":
+            payout = db.get_payout_by_tx(tx_id)
+            if payout is not None and payout["verify_url"]:
+                # The SDK can report failed although the receiver was paid: the
+                # verify checker reports the outcome once the receiver confirms.
+                if db.mark_verifying(payout["payout_id"]):
+                    logger.warning("Payment %s reported failed: verifying with the receiver", tx_id)
+                return
+        else:
+            payout = db.get_payout_by_tx(tx_id)
+            if payout is not None and db.mark_paid(payout["payout_id"]):
+                logger.warning("Payment %s reported failed earlier now succeeded", tx_id)
         payload = payload_for(payment, status)
-        inserted = db.enqueue(tx_id, status, payload)
-        if inserted:
+        outcome = db.enqueue(tx_id, status, payload)
+        if outcome == "inserted":
             logger.info("Enqueued webhook for tx_id=%s status=%s", tx_id, status)
+        elif outcome == "upgraded":
+            logger.warning("Payment %s reported failed earlier is now settled: delivering settled", tx_id)
 
 
 def _get_network() -> spark.Network:
@@ -92,8 +107,8 @@ async def disconnect() -> None:
         logger.info("Spark SDK disconnected")
 
 
-async def ensure_ln_address(destination: str) -> None:
-    """Verify the SDK parses the destination as a Lightning address.
+async def pay_request(destination: str):
+    """The LNURL-pay details of a Lightning address (callback, metadata, limits).
 
     Raises UnsupportedDestination for anything else (onchain, bolt11/bolt12,
     raw spark addresses) and for garbage input. The plugin layer additionally
@@ -106,6 +121,24 @@ async def ensure_ln_address(destination: str) -> None:
         raise UnsupportedDestination(f"Unparseable destination: {exc}") from exc
     if not parsed.is_lightning_address():
         raise UnsupportedDestination("Only Lightning address destinations are supported")
+    return parsed[0].pay_request
+
+
+async def ensure_ln_address(destination: str) -> None:
+    """Raise UnsupportedDestination unless destination is a Lightning address."""
+    await pay_request(destination)
+
+
+async def invoice_details(invoice: str):
+    """SDK-parsed details of a bolt11 invoice (amount, payment hash, expiry...)."""
+    sdk = await connect()
+    try:
+        parsed = await sdk.parse(input=invoice)
+    except Exception as exc:
+        raise receipts.InvalidInvoice(f"unparseable invoice: {exc}") from exc
+    if not parsed.is_bolt11_invoice():
+        raise receipts.InvalidInvoice("the Lightning address did not answer with a bolt11 invoice")
+    return parsed[0]
 
 
 def payment_key(payout_id: str) -> str:
@@ -113,27 +146,25 @@ def payment_key(payout_id: str) -> str:
     return str(uuid.uuid5(_PAYOUT_NAMESPACE, payout_id))
 
 
-async def send_lightning(destination: str, amount_sats: int, idempotency_key: str) -> dict:
-    """Send a Lightning payment to a Lightning address via the LNURL-pay flow.
+async def send_invoice(invoice: str, idempotency_key: str) -> dict:
+    """Pay a bolt11 invoice.
 
     The SDK makes at most one payment per idempotency_key: its storage is
     checked first and the key doubles as the Spark transfer id, so a repeat
     returns the original payment instead of paying again. That makes every
     failure here safe to retry with the same key.
 
-    Returns: {tx_id, status, error}; tx_id is empty when the send raised. For terminal outcomes a webhook
-    will follow (from the listener); the caller gets only the *initial* state.
+    Returns: {tx_id, status, error}; tx_id is empty when the send raised. For
+    terminal outcomes a webhook will follow (from the listener); the caller
+    gets only the *initial* state.
     """
     sdk = await connect()
     try:
-        parsed = await sdk.parse(input=destination)
-        if not parsed.is_lightning_address():
-            raise UnsupportedDestination("Destination is not a Lightning address")
-        prepare = await sdk.prepare_lnurl_pay(
-            request=spark.PrepareLnurlPayRequest(amount=amount_sats, pay_request=parsed[0].pay_request)
+        prepare = await sdk.prepare_send_payment(
+            request=spark.PrepareSendPaymentRequest(payment_request=spark.PaymentRequest.INPUT(input=invoice))
         )
-        response = await sdk.lnurl_pay(
-            request=spark.LnurlPayRequest(prepare_response=prepare, idempotency_key=idempotency_key)
+        response = await sdk.send_payment(
+            request=spark.SendPaymentRequest(prepare_response=prepare, idempotency_key=idempotency_key)
         )
     except Exception as exc:
         logger.exception("lightning payment failed")
