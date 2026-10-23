@@ -81,7 +81,7 @@ class OutboxTestCase(unittest.TestCase):
             for row in self.db.claim_due():
                 self.webhook._deliver_one(row)
 
-    def make_due(self):
+    def _make_due(self):
         with sqlite3.connect(self.db.DB_PATH) as conn:
             conn.execute("UPDATE webhook_outbox SET next_attempt_at = datetime('now')")
 
@@ -121,7 +121,7 @@ class GiveUpTest(OutboxTestCase):
             with self.subTest(status=status):
                 self.deliver_due(status)
                 self.assertIsNone(self.row()["abandoned_at"])
-                self.make_due()
+                self._make_due()
 
     def test_network_failures_are_retried_forever(self):
         self.enqueue(age_days=30, rejected_days=20)
@@ -140,14 +140,14 @@ class GiveUpTest(OutboxTestCase):
                 self.deliver_due(404, body=body)
                 self.assertIsNone(self.row()["abandoned_at"])
                 self.assertIsNone(self.row()["rejected_since"])
-                self.make_due()
+                self._make_due()
 
     def test_any_other_answer_resets_the_clock(self):
         self.enqueue(age_days=30, rejected_days=20)
         self.deliver_due(503)
         self.assertIsNone(self.row()["rejected_since"])
 
-        self.make_due()
+        self._make_due()
         self.deliver_due(404)
 
         self.assertIsNone(self.row()["abandoned_at"])
@@ -219,7 +219,7 @@ class MigrationTest(unittest.TestCase):
             _, db, _ = _load_modules(directory)
 
             self.assertEqual([row["tx_id"] for row in db.claim_due()], ["old"])
-            self.assertEqual(db.undelivered()["retrying"][0]["abandoned_at"], None)
+            self.assertIsNone(db.undelivered()["retrying"][0]["abandoned_at"])
 
 
 class UndeliveredEndpointTest(OutboxTestCase):
